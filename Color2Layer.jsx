@@ -1,9 +1,12 @@
 // @target after_effects
 // =============================================================================
 // Color2Layer — After Effects ScriptUI Panel
-// v0.3 — hue importance now driven by SOURCE saturation only (was min of source/label),
-//        plus stronger hue weighting overall — fixes vibrant orange→Peach and
-//        vibrant blue→Lavender mismatches reported on v0.2
+// v0.4 — switched from hue-weighted HSL to CIE76 Lab distance.
+//        HSL kept failing on edge cases that needed perceptual matching
+//        (vibrant orange / pale green Sea Foam vs mid Green) because hue
+//        and lightness aren't independent perceptual dimensions in HSL;
+//        Lab is designed so Euclidean distance ≈ perceived color
+//        difference, so a single uniform metric handles the whole space.
 //
 // Reads the fill colors of the selected shape layer(s), picks the dominant
 // color (average of all enabled Fill items), and sets the layer's Label
@@ -18,7 +21,7 @@
 
 (function (thisObj) {
 
-  var VERSION = "v0.3";
+  var VERSION = "v0.4";
 
   // ---------- helpers ----------
 
@@ -134,51 +137,47 @@
     return [r / colors.length, g / colors.length, b / colors.length];
   }
 
-  // RGB → HSL. h in degrees [0, 360), s and l in [0, 1].
-  function rgbToHsl(r, g, b) {
-    r = r / 255; g = g / 255; b = b / 255;
-    var max = Math.max(r, g, b);
-    var min = Math.min(r, g, b);
-    var l = (max + min) / 2;
-    var h, s;
-    if (max === min) {
-      h = 0; s = 0;
-    } else {
-      var d = max - min;
-      s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
-      if (max === r) h = ((g - b) / d + (g < b ? 6 : 0)) * 60;
-      else if (max === g) h = ((b - r) / d + 2) * 60;
-      else h = ((r - g) / d + 4) * 60;
+  // sRGB → CIE Lab (D65 illuminant). The chain is sRGB → linear RGB
+  // (gamma decode) → CIE XYZ → Lab. Numbers come from the canonical
+  // sRGB-to-XYZ matrix and the standard f(t) cube-root transform with
+  // the 6/29 cutoff. Returns [L, a, b] where L ∈ [0, 100] (lightness),
+  // a is green↔red, b is blue↔yellow.
+  function rgbToLab(r, g, b) {
+    function linearize(c) {
+      c = c / 255;
+      return c > 0.04045 ? Math.pow((c + 0.055) / 1.055, 2.4) : c / 12.92;
     }
-    return [h, s, l];
+    var rl = linearize(r), gl = linearize(g), bl = linearize(b);
+    var x = rl * 0.4124564 + gl * 0.3575761 + bl * 0.1804375;
+    var y = rl * 0.2126729 + gl * 0.7151522 + bl * 0.0721750;
+    var z = rl * 0.0193339 + gl * 0.1191920 + bl * 0.9503041;
+    x = x / 0.95047;
+    y = y / 1.00000;
+    z = z / 1.08883;
+    function f(t) {
+      return t > 0.008856 ? Math.pow(t, 1 / 3) : (7.787 * t + 16 / 116);
+    }
+    var fx = f(x), fy = f(y), fz = f(z);
+    return [116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz)];
   }
 
-  // Distance in HSL space, hue-weighted. v0.2 used `3 × min(satA, satB)`
-  // for hue weight, which had a subtle failure mode: when a label was
-  // less saturated than expected (e.g. AE's Blue at ~50% saturation), it
-  // would drag the hue weight down even for a vibrant source — so vibrant
-  // blue (#4894FE, s=99 %) ended up matching pastel Lavender (s=66 %,
-  // closer in s/l) instead of Blue (perfect hue match). Same shape:
-  // vibrant peach-orange (#FF9C70) matched Peach instead of Orange.
-  //
-  // v0.3 fix: hue importance reads ONLY the SOURCE color's saturation,
-  // and the multiplier is bumped to 8× so a clean hue match overrides
-  // s/l mismatches by a wide margin. s/l contribute proportionally less
-  // when the source is vibrant (slWeight slides from 1 down to 0.5 as
-  // sat rises). Near-grey sources still let s/l drive the match.
+  // CIE76 squared Lab distance (ΔE*ab without the sqrt — sqrt is monotonic
+  // so we can skip it). Lab is designed so that Euclidean distance
+  // approximates perceived color difference, which makes it the right
+  // metric for matching a shape's color to AE's 16 label presets:
+  //   - HSL v0.2/v0.3 needed bespoke weighting because hue/sat/lightness
+  //     aren't independent perceptual dimensions; vibrant orange kept
+  //     winning Peach because their lightness was close even though hue
+  //     was clearly Orange. Lab handles that uniformly without weights.
+  //   - CIEDE2000 is more accurate but a lot more code; CIE76 is good
+  //     enough for this 16-target matcher and is dependency-free in ES3.
   function colorDistance(a, b) {
-    var hslA = rgbToHsl(a[0], a[1], a[2]);
-    var hslB = rgbToHsl(b[0], b[1], b[2]);
-    var dh = Math.abs(hslA[0] - hslB[0]);
-    if (dh > 180) dh = 360 - dh;
-    dh = dh / 180;
-    var ds = hslA[1] - hslB[1];
-    var dl = hslA[2] - hslB[2];
-    var sourceSat = hslA[1];
-    var hueImportance = sourceSat * 8;
-    var slWeight = 1 - sourceSat * 0.5;
-    var weightedDh = dh * hueImportance;
-    return weightedDh * weightedDh + (ds * ds + dl * dl) * slWeight;
+    var labA = rgbToLab(a[0], a[1], a[2]);
+    var labB = rgbToLab(b[0], b[1], b[2]);
+    var dL = labA[0] - labB[0];
+    var da = labA[1] - labB[1];
+    var db = labA[2] - labB[2];
+    return dL * dL + da * da + db * db;
   }
 
   function closestLabelIndex(rgb) {

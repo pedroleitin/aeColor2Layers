@@ -2,7 +2,7 @@
 
 Tints an After Effects layer's **Label color** (the timeline-row color) to match what the layer actually draws. Walks the layer's shape Contents, collects every enabled Fill color, picks the mean, and sets the layer's `.label` to the closest of AE's 16 preference label colors.
 
-**Current version: v0.3.**
+**Current version: v0.4.**
 
 ## Why
 
@@ -32,10 +32,10 @@ For each layer:
 
 1. Walk `ADBE Root Vectors Group` recursively, collecting the value of every `ADBE Vector Fill Color` (and `ADBE Vector Stroke Color` when **Include strokes** is on) whose enclosing Fill / Stroke item has its eye icon on. Disabled items are ignored.
 2. Compute the **arithmetic mean** of all sampled RGBs. For the typical one- or two-fill icon this is just the fill color back; for multi-fill layers it's a representative average.
-3. Convert both the mean and each of AE's 16 label presets to **HSL**, then compute a **hue-weighted distance** driven by the source's saturation. When the source is vibrant, hue match dominates (so a vibrant blue maps to Blue, not Lavender). When the source is near-grey, saturation and lightness drive the match instead since hue is unreliable for grey. v0.1 used Euclidean RGB and mis-classified dark / desaturated purples as brown; v0.2 used HSL but its weight depended on the lower of source/label saturation, which let pastel labels win against vibrant sources — v0.3 reads only the source saturation.
+3. Convert both the mean and each of AE's 16 label presets to **CIE Lab** (D65) via the canonical sRGB → linear-RGB → XYZ → Lab chain, then compute the squared CIE76 distance (`ΔL² + Δa² + Δb²`). The label with the smallest distance wins. Lab is designed so that Euclidean distance approximates perceived color difference, which means a single uniform metric handles the whole color space — no manual weighting of hue vs saturation vs lightness needed.
 4. Set `layer.label = winningIndex` (1–16).
 
-The label RGB table currently ships **AE CC's default** label colors. Users who have customised their label colors in `Preferences > Labels` will get a close-but-not-identical match. v0.2+ may probe AE's preference store at panel launch to pick up the user's actual labels.
+The label RGB table currently ships **AE CC's default** label colors. Users who have customised their label colors in `Preferences > Labels` will get a close-but-not-identical match. A future version may probe AE's preference store at panel launch to pick up the user's actual labels.
 
 ## What it does NOT (yet) do
 
@@ -44,7 +44,7 @@ The label RGB table currently ships **AE CC's default** label colors. Users who 
 - **Weight by shape area** — the mean treats a 5-pixel accent the same as a 500-pixel background. For most icons this lands on the right hue anyway; for layered comps with one large background and several small accents it can drift toward grey.
 - **Custom user label colors** — see above. The defaults table is hard-coded.
 - **Non-shape layers** — solids, nulls, images, precomps, text are silently skipped (reported in the status line as "skipped").
-- **Color-space-aware distance** — Euclidean RGB is used. Good enough for AE's 16 spread-across-the-hue-circle presets; would be tighter with a Lab / Oklch metric.
+- **CIEDE2000 accuracy** — CIE76 (used here) is the simplest perceptual metric and good enough for AE's 16 spread-out presets. CIEDE2000 corrects CIE76's known weaknesses around blues and greys but is ~20× the code; revisit if specific mismatches show up.
 
 ## Working in this repo
 
@@ -63,3 +63,10 @@ The label RGB table currently ships **AE CC's default** label colors. Users who 
 | Fill color | `ADBE Vector Fill Color` |
 | Stroke item | `ADBE Vector Graphic - Stroke` |
 | Stroke color | `ADBE Vector Stroke Color` |
+
+## Changelog
+
+- **v0.4** — Switched the matcher to **CIE76 Lab distance**. HSL kept producing wrong-looking results on edge cases where the source's hue was closer to a pale label than to its perceptually-correct match (e.g. mid green `#4AA647` mapped to pale Sea Foam because their hues were 2° apart, while Green's hue was 17° off). Lab is perceptually uniform — `ΔL² + Δa² + Δb²` between a shape's color and a label's color is roughly proportional to how different they look, with no manual weighting needed. Resolves vibrant-orange→Peach, vibrant-blue→Lavender, and mid-green→Sea Foam mismatches reported on v0.1–v0.3 in a single change.
+- **v0.3** — HSL hue importance now reads only the source's saturation (was the min of source/label) and the multiplier was bumped to 8×. Fixed vibrant blue `#4894FE` matching pastel Lavender instead of Blue. Did not fix `#FF9C70`→Orange or `#4AA647`→Green — those needed the v0.4 algorithm switch.
+- **v0.2** — Replaced Euclidean RGB with a hue-weighted HSL distance to fix dark/desaturated purples mapping to Brown. Worked for the hue family but still leaned on tunable weights for vibrant sources, leaving the edge cases that drove v0.3 and v0.4.
+- **v0.1** — Initial release. Walk Contents, average fill colors, Euclidean RGB distance to the 16 hard-coded AE CC default label colors, set `layer.label`.
