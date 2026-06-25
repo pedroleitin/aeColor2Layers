@@ -311,7 +311,7 @@
   function buildUI(thisObj) {
     var win = (thisObj instanceof Panel)
       ? thisObj
-      : new Window("palette", "Color\u2192Layer " + VERSION,
+      : new Window("palette", "Color→Layer " + VERSION,
                    undefined, { resizeable: true });
 
     win.orientation = "column";

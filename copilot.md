@@ -1,8 +1,9 @@
 # Copilot instructions — Color→Layer
 
-After Effects ScriptUI panel that reads a shape layer's fill colors and sets the layer's
-timeline **Label color** to the closest of AE's 16 preference label presets. Single file,
-no build, no tests.
+After Effects ScriptUI panel for shape layers, with two batch actions: **Tint** (set the
+layer's timeline **Label color** to the closest of AE's 16 preference label presets) and
+**Split groups into layers** (duplicate a layer into one layer per top-level shape group).
+Single file (`Color→Layer.jsx`), no build, no tests.
 
 ## The one rule that breaks everything: ES3 ExtendScript only
 
@@ -20,7 +21,9 @@ the way the existing code does.
 
 ## Architecture (single file: `Color→Layer.jsx`)
 
-Everything lives in one IIFE `(function (thisObj) { ... })(this)`. Pipeline per layer:
+Everything lives in one IIFE `(function (thisObj) { ... })(this)`.
+
+**Tint pipeline (per layer):**
 
 1. **`collectShapeColors`** → walks `ADBE Root Vectors Group` recursively via `walkGroup`,
    pushing each **enabled** Fill (and Stroke, when opted in) color as `[r,g,b]` in 0–255.
@@ -31,7 +34,17 @@ Everything lives in one IIFE `(function (thisObj) { ... })(this)`. Pipeline per 
 5. **`closestLabelIndex`** → nearest of the 16 `LABEL_COLORS`, returns 1-based index.
 6. **`applyToLayer`** sets `layer.label = idx`. `0` means "no label".
 
-UI is built in `buildUI`; the action runs inside `app.beginUndoGroup` / `app.endUndoGroup`
+**Split pipeline (per layer): `splitShapeLayerGroups`**
+
+Duplicates the layer once per top-level `ADBE Vector Group`, then on each duplicate keeps
+only the target group and removes the rest. Critical constraint: ExtendScript **cannot move
+or copy a property across layers** (`PropertyBase.moveTo` only reorders within one parent),
+and removing a sibling **invalidates any stored `Property` reference**. So deletion must
+re-query `property(j)` by live index each time (`collectTopLevelGroups` finds them, the
+loop walks descending and skips the keeper's index). Don't refactor this back into
+clone-and-move or stored-reference deletion — that's exactly the v0.6 bug.
+
+UI is built in `buildUI`; each action runs inside `app.beginUndoGroup` / `app.endUndoGroup`
 so the whole batch reverts with one undo.
 
 ## Conventions to preserve
@@ -57,8 +70,10 @@ customized labels), CIE76 not CIEDE2000. See `README.md` → "What it does NOT d
 
 Install `Color→Layer.jsx` into AE's `Scripts/ScriptUI Panels/` and restart AE, **or** for
 fast iteration use `File → Scripts → Run Script File…` (reloads without restart, opens as a
-floating window). Then open a comp with a known-color shape layer, click **Tint selected
-layers**, and confirm the timeline row turns the expected label color.
+floating window). Then open a comp with a known-color shape layer: click **Tint selected
+layers** and confirm the timeline row turns the expected label color; or select a layer with
+several groups, click **Split groups into layers**, and confirm each new layer holds exactly
+one group.
 
 ## When changing the color math
 
