@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+
+# Claude Code workspace metadata
+.claude/
+
+# Local working copies and scratch
+temp/
+alt-version/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
