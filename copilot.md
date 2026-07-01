@@ -1,8 +1,14 @@
 # Copilot instructions — Color→Layer
 
-After Effects ScriptUI panel for shape layers, with two batch actions: **Tint** (set the
-layer's timeline **Label color** to the closest of AE's 16 preference label presets) and
-**Split groups into layers** (duplicate a layer into one layer per top-level shape group).
+After Effects ScriptUI panel for shape layers. It hosts **two tools stacked in one dockable
+window**, sharing a single status footer:
+
+- **Color→Layer** — two batch actions: **Tint** (set the timeline **Label color** to the
+  closest of AE's 16 preference label presets) and **Split groups into layers** (duplicate a
+  layer into one layer per top-level shape group).
+- **Vector Color Swatches** — a persistent color palette: add / extract / import colors and
+  apply a swatch to the Fill / Stroke / Both of selected shape layers.
+
 Single file (`Color→Layer.jsx`), no build, no tests.
 
 ## The one rule that breaks everything: ES3 ExtendScript only
@@ -21,7 +27,15 @@ the way the existing code does.
 
 ## Architecture (single file: `Color→Layer.jsx`)
 
-Everything lives in one IIFE `(function (thisObj) { ... })(this)`.
+The file is an outer envelope `(function (thisObj) { ... })(this)` that builds the window
+(the top rainbow strip, two host containers, and one shared status footer), then calls two
+**module functions** — `buildColorToLayerModule(host, sharedStatus)` and
+`buildDynamicPaletteModule(host, sharedStatus)`. Each module keeps the original tool's logic
+in its own scope, so same-named helpers (`buildUI`, `safeProp`, etc.) don't collide. When
+editing a tool, work inside its module; shared chrome (window, footer, rainbow) lives in the
+envelope. The palette module renders its icons from flattened Material SVG paths (ScriptUI
+has no SVG/Bézier support) and forces AE's native color picker by temporarily toggling the
+"Use System Color Picker" preference.
 
 **Tint pipeline (per layer):**
 
@@ -77,6 +91,7 @@ one group.
 
 ## When changing the color math
 
-Bump `VERSION` and add a `## Changelog` entry in `README.md` explaining what edge case the
+Bump the version (`PANEL_VERSION` in the outer envelope and the module's own `VERSION`) and
+add a `## Changelog` entry in `README.md` explaining what edge case the
 change fixes — the changelog there documents why HSL was abandoned for Lab (v0.1→v0.4) and
 is the institutional memory for this matcher.

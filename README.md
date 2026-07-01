@@ -1,11 +1,12 @@
 # Color→Layer — After Effects ScriptUI Panel
 
-Two batch helpers for shape layers, in one dockable panel:
+Two batch helpers for shape layers, plus a color-swatch palette, in one dockable panel:
 
 - **Tint** — sets a layer's **Label color** (the timeline-row color) to match what the layer actually draws. Walks the layer's shape Contents, collects every enabled Fill color, picks the mean, and sets the layer's `.label` to the closest of AE's 16 preference label colors.
 - **Split groups into layers** — duplicates each selected shape layer and creates one new layer per top-level shape group, so grouped objects can be separated and arranged independently. The original layer is preserved.
+- **Vector Color Swatches** — a reusable color palette. Add colors (via AE's native color picker), extract colors from selected layers, import ASE palettes, and apply a swatch to the Fill / Stroke / both of selected shape layers. Palettes persist between sessions.
 
-**Current version: v0.7.** Installed as `Color→Layer.jsx`.
+**Current version: v0.8.** Installed as `Color→Layer.jsx`.
 
 ## Why
 
@@ -26,7 +27,8 @@ When a project grows past 30–40 layers, scanning the timeline by name alone be
 2. Optionally tick **Include stroke colors** if the layer's design lives in its strokes rather than its fills (typical for line-art / outline icons).
 3. Click **Tint selected layers** to tint each shape layer to the closest AE label color.
 4. Click **Split groups into layers** to duplicate each selected shape layer and create one new layer per top-level shape group, preserving the original layer.
-5. The status panel reports what happened for each batch action.
+5. Use the **Vector Color Swatches** section below to build a palette (add / extract / import), pick a Fill / Stroke / Both target, and click a swatch to apply it to the selected layers.
+6. The shared status line at the bottom reports what happened for each action.
 
 The actions are wrapped in Undo groups, so a single Cmd/Ctrl-Z reverts every layer in the batch.
 
@@ -81,6 +83,13 @@ All edits stay inside a single layer's property tree, which AE fully supports. T
 
 ## Changelog
 
+- **v0.8** — Combined the standalone **Vector Color Swatches / Dynamic Color Palette** tool into the same panel, stacked below the Tint / Split actions. Each tool is wrapped in its own isolated module function so their helpers and state don't collide, and both report into a single shared status footer. Also in this release:
+  - **Google Material icons** for the palette's action and Fill/Stroke/Both buttons, rendered from their SVG paths (ScriptUI has no SVG/Bézier support, so paths are flattened to line segments and filled), all at a uniform size with a hover highlight.
+  - **Rounded primary buttons** — Tint / Split are now custom-drawn rounded rectangles; Split gained an `alt_route` split icon to the left of its label.
+  - **Full-bleed rainbow strip** flush to the top and side edges of the window.
+  - **Footer** consolidated to a single line (status message + version), pinned to the bottom, and auto-hidden when the window is too short so the swatch grid keeps the room.
+  - **Swatch grid** re-flows to the panel width instead of cropping.
+  - **AE-native color picker** — the palette's Add/Edit now force AE's own color picker (temporarily toggling the "Use System Color Picker" preference and restoring it afterward) instead of the OS picker.
 - **v0.7** — Fixed **Split groups into layers**: every split layer previously came out containing all groups. The old approach cloned a group and `moveTo`'d it onto a fresh layer (an unsupported cross-layer move) and then held stale `Property` references through deletes. Now each duplicate keeps only its target group, with all others removed via live property-index lookup.
 - **v0.6** — Added a **Split groups into layers** action. It duplicates each selected shape layer and creates one new layer per top-level shape group, so grouped shapes can be separated and arranged independently while the original layer is preserved.
 - **v0.5** — UI refresh. Renamed the panel to **Color→Layer** (window title, header, undo-group label). Recolored the header accent from purple to orange. Added a thin rainbow strip across the top of the panel, painted band-by-band in a best-effort `onDraw` handler (ScriptUI has no native gradient brush). No color-matching behavior changed.

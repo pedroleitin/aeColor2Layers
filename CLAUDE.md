@@ -1,8 +1,17 @@
 # CLAUDE.md — Color→Layer
 
 After Effects ScriptUI panel for shape layers. One file, `Color→Layer.jsx`, no build, no
-tests. Two batch actions: **Tint** (set the layer Label color to the closest of AE's 16
-label presets) and **Split groups into layers** (one layer per top-level shape group).
+tests. It hosts **two tools stacked in one dockable window**, sharing a single status footer:
+
+- **Color→Layer** — two batch actions: **Tint** (set the layer Label color to the closest of
+  AE's 16 label presets) and **Split groups into layers** (one layer per top-level shape group).
+- **Vector Color Swatches** — a persistent color palette: add / extract / import colors and
+  apply a swatch to the Fill / Stroke / Both of selected shape layers.
+
+Each tool is wrapped in its own module function (`buildColorToLayerModule`,
+`buildDynamicPaletteModule`) so their helpers and state stay isolated; an outer envelope
+`(function(thisObj){…})(this)` builds the window, the top rainbow strip, the two host
+containers, and the shared footer, then injects that footer into each module.
 
 `copilot.md` and `README.md` hold the full architecture, the matchName table, and the
 changelog — read them before changing behavior. The essentials:
@@ -37,5 +46,6 @@ with several groups → each new layer holds exactly one group.
 
 ## Releasing a change
 
-Bump `VERSION` in the `.jsx` and add a `## Changelog` entry in `README.md` saying what it
-fixes. Commit/push only when asked.
+Bump the version in the `.jsx` (`PANEL_VERSION` in the outer envelope — shown in the footer
+— and the module's own `VERSION`) and add a `## Changelog` entry in `README.md` saying what
+it fixes. Commit/push only when asked.
