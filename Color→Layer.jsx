@@ -62,15 +62,24 @@
     } catch (eRainbow) {}
   };
 
-  // ----- Section 1: Color→Layer -----
+  // ----- Section 1: Vector Color Swatches -----
+  var host2 = win.add("group");
+  host2.orientation = "column";
+  host2.alignment = ["fill", "top"];
+
+  // ----- Section 2: Color→Layer -----
   var host1 = win.add("group");
   host1.orientation = "column";
   host1.alignment = ["fill", "top"];
 
-  // ----- Section 2: Vector Color Swatches -----
-  var host2 = win.add("group");
-  host2.orientation = "column";
-  host2.alignment = ["fill", "fill"];
+  // Flexible spacer that absorbs the leftover vertical room so the footer
+  // below stays pinned to the bottom edge of the window. An explicit minimal
+  // preferredSize makes ScriptUI treat the empty group as a proper spring.
+  var spacer = win.add("group");
+  spacer.alignment = ["fill", "fill"];
+  spacer.minimumSize = [0, 0];
+  spacer.preferredSize = [1, 1];
+  spacer.maximumSize.height = 4000;
 
   // ----- Shared status footer -----
   // Both tools report into this single status line at the bottom of the
@@ -185,7 +194,7 @@ function buildColorToLayerModule(__host__, __status__) {
     [180, 180, 245],   //  5 Lavender
     [250, 210, 170],   //  6 Peach
     [180, 220, 180],   //  7 Sea Foam
-    [ 85, 100, 200],   //  8 Blue
+    [ 45,  95, 210],   //  8 Blue
     [ 95, 160,  60],   //  9 Green
     [130,  90, 200],   // 10 Purple
     [210, 115,  70],   // 11 Orange
@@ -212,15 +221,29 @@ function buildColorToLayerModule(__host__, __status__) {
   // Strokes are optionally included — the typical "label should match the
   // shape" intent is fill-driven, but a stroke-only icon (line art) needs
   // strokes to be sampled too. Controlled by the `includeStrokes` flag.
+  //
+  // Additionally, even with strokes off, a layer with NO enabled fills falls
+  // back to its stroke colors so a stroke-only layer still gets tinted rather
+  // than skipped.
   function collectShapeColors(layer, includeStrokes) {
-    var out = [];
+    var acc = { fills: [], strokes: [] };
     var root = safeProp(layer, "ADBE Root Vectors Group");
-    if (!root) return out;
-    walkGroup(root, out, includeStrokes);
-    return out;
+    if (!root) return { colors: [], usedStrokeFallback: false };
+    walkGroup(root, acc);
+    var usedStrokeFallback = false;
+    var colors = acc.fills;
+    if (includeStrokes) {
+      // Sample fills and strokes together.
+      colors = acc.fills.concat(acc.strokes);
+    } else if (acc.fills.length === 0 && acc.strokes.length > 0) {
+      // No fills defined — fall back to strokes so the layer still gets a color.
+      colors = acc.strokes;
+      usedStrokeFallback = true;
+    }
+    return { colors: colors, usedStrokeFallback: usedStrokeFallback };
   }
 
-  function walkGroup(group, out, includeStrokes) {
+  function walkGroup(group, acc) {
     var i;
     for (i = 1; i <= group.numProperties; i++) {
       var item = group.property(i);
@@ -228,18 +251,18 @@ function buildColorToLayerModule(__host__, __status__) {
       var mn = item.matchName;
       if (mn === "ADBE Vector Group") {
         var inner = safeProp(item, "ADBE Vectors Group");
-        if (inner) walkGroup(inner, out, includeStrokes);
+        if (inner) walkGroup(inner, acc);
       } else if (mn === "ADBE Vector Graphic - Fill") {
         var fc = safeProp(item, "ADBE Vector Fill Color");
         var rgb = staticValue(fc);
         if (rgb && rgb.length >= 3) {
-          out.push([rgb[0] * 255, rgb[1] * 255, rgb[2] * 255]);
+          acc.fills.push([rgb[0] * 255, rgb[1] * 255, rgb[2] * 255]);
         }
-      } else if (includeStrokes && mn === "ADBE Vector Graphic - Stroke") {
+      } else if (mn === "ADBE Vector Graphic - Stroke") {
         var sc = safeProp(item, "ADBE Vector Stroke Color");
         var srgb = staticValue(sc);
         if (srgb && srgb.length >= 3) {
-          out.push([srgb[0] * 255, srgb[1] * 255, srgb[2] * 255]);
+          acc.strokes.push([srgb[0] * 255, srgb[1] * 255, srgb[2] * 255]);
         }
       }
     }
@@ -426,14 +449,21 @@ function buildColorToLayerModule(__host__, __status__) {
   //   { ok: false, reason }                    — couldn't apply (e.g. no fills)
 
   function applyToLayer(layer, includeStrokes) {
-    var colors = collectShapeColors(layer, includeStrokes);
+    var res = collectShapeColors(layer, includeStrokes);
+    var colors = res.colors;
     if (colors.length === 0) {
-      return { ok: false, reason: "no enabled fills found" };
+      return { ok: false, reason: "no enabled fills or strokes found" };
     }
     var dom = dominantColor(colors);
     var idx = closestLabelIndex(dom);
     layer.label = idx;
-    return { ok: true, labelIdx: idx, labelName: LABEL_NAMES[idx - 1], rgb: dom };
+    return {
+      ok: true,
+      labelIdx: idx,
+      labelName: LABEL_NAMES[idx - 1],
+      rgb: dom,
+      usedStrokeFallback: res.usedStrokeFallback
+    };
   }
 
   // ---------- UI ----------
@@ -444,7 +474,7 @@ function buildColorToLayerModule(__host__, __status__) {
     win.orientation = "column";
     win.alignChildren = ["fill", "top"];
     win.spacing = 8;
-    win.margins = 12;
+    win.margins = 10;
 
     // Best-effort font/color styling. ScriptUI's graphics API is
     // supported inconsistently across OS / AE versions; wrap every
@@ -510,7 +540,9 @@ function buildColorToLayerModule(__host__, __status__) {
     // (a separate ExtendScript scope) can draw a glyph without depending on it.
     var BTN_ICONS = {
       // alt_route — split groups into layers
-      "split": { vb: [0, -960, 960, 960], d: "M450-80v-200q0-48-16-79t-49-64l43-43q13 11 27.5 30t24.5 35q17-26 33.5-45t31.5-32q58-47 83.5-113.5T648-766l-90 90-42-42 162-162 162 162-42 42-90-90q5 126-24.5 198.5T585-432q-44 40-59.5 73T510-280v200h-60ZM258-636q-4-18-6.5-52.5T251-765l-89 89-42-42 162-162 162 162-42 42-90-90q-2 38-1 66.5t5 49.5l-58 14Zm84 171q-17-18-37.5-47.5T273-577l59-15q9 25 24 48t28 37l-42 42Z" }
+      "split": { vb: [0, -960, 960, 960], d: "M450-80v-200q0-48-16-79t-49-64l43-43q13 11 27.5 30t24.5 35q17-26 33.5-45t31.5-32q58-47 83.5-113.5T648-766l-90 90-42-42 162-162 162 162-42 42-90-90q5 126-24.5 198.5T585-432q-44 40-59.5 73T510-280v200h-60ZM258-636q-4-18-6.5-52.5T251-765l-89 89-42-42 162-162 162 162-42 42-90-90q-2 38-1 66.5t5 49.5l-58 14Zm84 171q-17-18-37.5-47.5T273-577l59-15q9 25 24 48t28 37l-42 42Z" },
+      // colors — tint selected layers
+      "tint": { vb: [0, -960, 960, 960], d: "M348-138 98-388q-9-9.12-13.5-20.06T80-430.7q0-11.7 4.5-22.5T98-473l250-250-114-114 43-43 406 407q9.47 9 13.74 19.8 4.26 10.8 4.26 22.5t-4.26 22.64Q692.47-397.12 683-388L433-138q-9 9-19.8 13.5t-22.5 4.5q-11.7 0-22.64-4.5Q357.12-129 348-138Zm43-542L141-430h500L391-680Zm408.66 560q-33.35 0-56.5-23.18Q720-166.36 720-200q0-26.28 10-49.64T756-293l44-57 44 57q15 20 25.5 43.36T880-200q0 33.64-23.5 56.82T799.66-120Z" }
     };
     function flattenIconPath(d, steps) {
       if (!steps) steps = 12;
@@ -608,7 +640,7 @@ function buildColorToLayerModule(__host__, __status__) {
       } catch (eBg) {}
       var tcol = on ? [0.93, 0.93, 0.95, 1] : [0.5, 0.5, 0.55, 1];
       var iconSize = 18;
-      var iconGap = 6;
+      var iconPad = 10;
       var iconDef = (this._icon && BTN_ICONS[this._icon]) ? BTN_ICONS[this._icon] : null;
       try {
         var txt = this._label || "";
@@ -617,15 +649,11 @@ function buildColorToLayerModule(__host__, __status__) {
         var dim = g.measureString(txt, font, w);
         var tw = (dim && dim.width) ? dim.width : (dim ? dim[0] : 0);
         var th = (dim && dim.height) ? dim.height : (dim ? dim[1] : 0);
-        // Center the icon+text block as a unit when an icon is present.
-        var blockW = iconDef ? (iconSize + iconGap + tw) : tw;
-        var startX = (w - blockW) / 2;
+        // Icon (if any) pinned to the left edge; label stays centered.
         if (iconDef) {
-          drawIconAt(g, iconDef, startX, (h - iconSize) / 2, iconSize, tcol);
-          g.drawString(txt, tpen, startX + iconSize + iconGap, (h - th) / 2, font);
-        } else {
-          g.drawString(txt, tpen, (w - tw) / 2, (h - th) / 2, font);
+          drawIconAt(g, iconDef, iconPad, (h - iconSize) / 2, iconSize, tcol);
         }
+        g.drawString(txt, tpen, (w - tw) / 2, (h - th) / 2, font);
       } catch (eTxt) {}
     }
     function makeRoundButton(parent, label, tip, handler) {
@@ -639,49 +667,33 @@ function buildColorToLayerModule(__host__, __status__) {
       return btn;
     }
 
-    // ===== Header =====
-    var header = win.add("group");
-    header.orientation = "column";
-    header.alignment = ["fill", "top"];
-    header.alignChildren = ["center", "center"];
-    header.spacing = 1;
-    header.margins = [0, 6, 0, 8];
-
-    var titleText = header.add("statictext", undefined, "Color\u2192Layer");
-    fontBold(titleText, 16);
-    colorAccent(titleText);
-
     // ===== Primary actions =====
     // Tint button sits beside a compact "Strokes" toggle that controls whether
     // stroke colors are sampled alongside fills.
-    var applyRow = win.add("group");
-    applyRow.orientation = "row";
-    applyRow.alignment = ["fill", "top"];
-    applyRow.alignChildren = ["left", "center"];
-    applyRow.spacing = 8;
-
-    var applyBtn = makeRoundButton(applyRow, "Tint selected layers",
+    var applyBtn = makeRoundButton(win, "Tint selected layers",
       "Walk each selected shape layer's enabled Fill items, "
       + "compute the mean color, and set the layer's Label color to the "
-      + "closest of AE's 16 label presets.", null);
-    applyBtn.alignment = ["fill", "center"];
-    applyBtn.maximumSize.width = 10000;
-    applyBtn.preferredSize = [180, 34];
-    applyBtn.minimumSize = [120, 34];
+      + "closest of AE's 16 label presets. Layers with no fill fall back to "
+      + "their stroke color.", null);
+    applyBtn._icon = "tint";
+    applyBtn.alignment = ["left", "top"];
+    applyBtn.maximumSize.width = 290;
+    applyBtn.preferredSize = [290, 34];
+    applyBtn.minimumSize = [80, 34];
 
-    var includeStrokesCb = applyRow.add("checkbox", undefined, "Strokes");
-    includeStrokesCb.alignment = ["right", "center"];
-    includeStrokesCb.helpTip = "When on, stroke colors are sampled alongside fills. "
-      + "Useful for line-art / outline-only icons where the stroke IS the color.";
+    // Strokes toggle is hidden for now: layers with no fill already fall back
+    // to their stroke color automatically. This flag stands in for the old
+    // checkbox so the click handler is unchanged; false = fills-only sampling.
+    var includeStrokes = false;
 
     var splitBtn = makeRoundButton(win, "Split groups into layers",
       "Duplicate each selected shape layer and create one new layer per top-level shape group.",
       null);
     splitBtn._icon = "split";
-    splitBtn.alignment = ["fill", "top"];
-    splitBtn.maximumSize.width = 10000;
-    splitBtn.preferredSize = [220, 34];
-    splitBtn.minimumSize = [140, 34];
+    splitBtn.alignment = ["left", "top"];
+    splitBtn.maximumSize.width = 290;
+    splitBtn.preferredSize = [290, 34];
+    splitBtn.minimumSize = [80, 34];
 
     // ===== Status area =====
     // Reuses the shared status control from the host window so this tool and
@@ -699,7 +711,7 @@ function buildColorToLayerModule(__host__, __status__) {
         statusText.text = "Nothing selected — pick one or more shape layers.";
         return;
       }
-      var inclStrokes = !!includeStrokesCb.value;
+      var inclStrokes = !!includeStrokes;
 
       app.beginUndoGroup("Color\u2192Layer: tint labels");
       var tinted = 0;
@@ -781,7 +793,22 @@ function buildColorToLayerModule(__host__, __status__) {
     // Docked-panel resize handler — re-flow children when AE resizes the
     // dock chrome after construction. Without this, the Tint button stays
     // at its intrinsic width on the left edge in docked mode.
+    var BTN_MAX_W = 290;
+    function fitButtons() {
+      var avail = 0;
+      try { if (win.size && win.size[0]) { avail = win.size[0] - 20; } } catch (eBW) {}
+      if (avail <= 0) { return; }
+      var w = avail < BTN_MAX_W ? avail : BTN_MAX_W;
+      if (w < 80) { w = 80; }
+      try {
+        applyBtn.preferredSize = [w, 34];
+        applyBtn.maximumSize = [w, 34];
+        splitBtn.preferredSize = [w, 34];
+        splitBtn.maximumSize = [w, 34];
+      } catch (eFB) {}
+    }
     win.onResizing = win.onResize = function () {
+      fitButtons();
       try { this.layout.resize(); } catch (eR) {}
     };
 
@@ -789,6 +816,8 @@ function buildColorToLayerModule(__host__, __status__) {
       win.center();
       win.show();
     }
+    fitButtons();
+    try { win.layout.resize(); } catch (eIR) {}
     return win;
   }
 
@@ -1099,6 +1128,92 @@ function buildDynamicPaletteModule(__host__, __status__) {
         while (container.children.length > 0) {
             container.remove(container.children[0]);
         }
+    }
+
+    // Thin vertical divider used inside the action toolbar to set the
+    // destructive "clear all" button apart from the rest.
+    function drawDivider() {
+        try {
+            var g = this.graphics;
+            var b = g.newBrush(g.BrushType.SOLID_COLOR, [1, 1, 1, 0.18]);
+            g.newPath();
+            g.rectPath(0, 0, 1, this.size.height);
+            g.fillPath(b);
+        } catch (eDiv) {}
+    }
+
+    // Minimal flow-layout engine. ScriptUI can't reparent controls and has no
+    // native wrapping, so each "flow" owns a host column group and rebuilds its
+    // children into as many single-line row sub-groups as fit `avail` px wide.
+    // Items are described by an approximate width plus a create(row) callback
+    // that builds the control fresh (and re-wires any shared module vars). A
+    // layout signature guards against rebuilding when the wrapping is unchanged,
+    // so dragging the panel doesn't flicker.
+    function makeFlow(host, spacing) {
+        var items = [];
+        var flow = {
+            host: host,
+            _sig: "",
+            add: function (w, create) {
+                items.push({ w: w, create: create });
+                return flow;
+            },
+            reset: function () { flow._sig = ""; },
+            reflow: function (avail) {
+                if (!avail || avail <= 0) { avail = 99999; }
+                var breaks = [];
+                var used = 0, rowStart = 0, k;
+                for (k = 0; k < items.length; k++) {
+                    var iw = items[k].w;
+                    if (k === rowStart) {
+                        used = iw;
+                    } else if ((used + spacing + iw) > avail) {
+                        breaks.push(k);
+                        rowStart = k;
+                        used = iw;
+                    } else {
+                        used = used + spacing + iw;
+                    }
+                }
+                var sig = breaks.join(",") + "|" + items.length;
+                if (sig === flow._sig) { return false; }
+                flow._sig = sig;
+                clearChildren(host);
+                var row = null;
+                for (k = 0; k < items.length; k++) {
+                    var isBreak = false;
+                    for (var b = 0; b < breaks.length; b++) {
+                        if (breaks[b] === k) { isBreak = true; break; }
+                    }
+                    if (k === 0 || isBreak || !row) {
+                        row = host.add("group");
+                        row.orientation = "row";
+                        row.alignChildren = ["left", "center"];
+                        row.alignment = ["left", "top"];
+                        row.spacing = spacing;
+                        row.margins = 0;
+                    }
+                    items[k].create(row);
+                }
+                return true;
+            }
+        };
+        return flow;
+    }
+
+    function makeModeClick(mode) {
+        return function () { setTargetMode(mode); };
+    }
+
+    function makeModeBtn(row, mode, tip) {
+        var b = row.add("iconbutton", undefined, undefined, { style: "toolbutton", toggle: true });
+        b.mode = mode;
+        b.size = [42, 34];
+        b.preferredSize = [42, 34];
+        b.helpTip = tip;
+        b.onDraw = drawTargetIcon;
+        b.onClick = makeModeClick(mode);
+        return b;
     }
 
     function colorMatches(a, b) {
@@ -1587,13 +1702,18 @@ function buildDynamicPaletteModule(__host__, __status__) {
     var MATERIAL_ICONS = {
         // add_2 — plus
         "add": { vb: [0, -960, 960, 960], d: "M450-120v-330H120v-60h330v-330h60v330h330v60H510v330h-60Z" },
-        // colorize (eyedropper) — used for "extract colors from layers".
-        "extract": {
+        // colorize (eyedropper) — pick a color from the screen.
+        "pick": {
             vb: [0, -960, 960, 960],
             d: "M120-120v-190l358-358-58-56 58-56 76 76 124-124q5-5 12.5-8t15.5-3q8 0 15 3t13 8l94 94q5 6 8 13t3 15q0 8-3 15.5t-8 12.5L705-555l76 78-57 57-56-58-358 358H120Zm80-80h78l332-334-76-76-334 332v78Zm447-410 96-96-37-37-96 96 37 37Zm0 0-37-37 37 37Z"
         },
-        // upload — import ASE palette
-        "import": { vb: [0, -960, 960, 960], d: "M450-313v-371L330-564l-43-43 193-193 193 193-43 43-120-120v371h-60ZM220-160q-24 0-42-18t-18-42v-143h60v143h520v-143h60v143q0 24-18 42t-42 18H220Z" },
+        // chip_extraction — extract colors from selected layers.
+        "extract": {
+            vb: [0, -960, 960, 960],
+            d: "M480-121q-75 0-140.5-28.5t-114-77q-48.5-48.5-77-114T120-481q0-75 28.5-140.5t77-114q48.5-48.5 114-77T480-841v60q-124 0-212 88t-88 212q0 125.36 88 212.68Q356-181 480-181v60Zm173-173-42-43 113-113H360v-60h364L611-624l42-42 186 186-186 186Z"
+        },
+        // download — import ASE palette
+        "import": { vb: [0, -960, 960, 960], d: "M480-313 287-506l43-43 120 120v-371h60v371l120-120 43 43-193 193ZM220-160q-24 0-42-18t-18-42v-143h60v143h520v-143h60v143q0 24-18 42t-42 18H220Z" },
         // backspace — remove selected swatch
         "remove": { vb: [0, -960, 960, 960], d: "m448-326 112-112 112 112 43-43-113-111 111-111-43-43-110 112-112-112-43 43 113 111-113 111 43 43Zm-98 166q-14.25 0-27-6.38-12.75-6.37-21-17.62L80-480l221-296q8.25-11.25 21-17.63 12.75-6.37 27-6.37h472q24.75 0 42.38 17.62Q881-764.75 881-740v520q0 24.75-17.62 42.37Q845.75-160 821-160H350ZM155-480l195 260h471v-520H350L155-480Zm431 0Z" },
         // cancel_presentation — clear all swatches
@@ -1603,7 +1723,7 @@ function buildDynamicPaletteModule(__host__, __status__) {
         // crop_square — apply to Stroke only (outline square)
         "stroke": { vb: [0, -960, 960, 960], d: "M180-120q-24 0-42-18t-18-42v-600q0-24 18-42t42-18h600q24 0 42 18t18 42v600q0 24-18 42t-42 18H180Zm0-60h600v-600H180v600Zm0 0v-600 600Z" },
         // colors — apply to Fill and Stroke
-        "both": { vb: [0, -960, 960, 960], d: "M348-138 98-388q-9-9.12-13.5-20.06T80-430.7q0-11.7 4.5-22.5T98-473l250-250-114-114 43-43 406 407q9.47 9 13.74 19.8 4.26 10.8 4.26 22.5t-4.26 22.64Q692.47-397.12 683-388L433-138q-9 9-19.8 13.5t-22.5 4.5q-11.7 0-22.64-4.5Q357.12-129 348-138Zm43-542L141-430h500L391-680Zm408.66 560q-33.35 0-56.5-23.18Q720-166.36 720-200q0-26.28 10-49.64T756-293l44-57 44 57q15 20 25.5 43.36T880-200q0 33.64-23.5 56.82T799.66-120Z" }
+        "both": { vb: [0, 0, 24, 24], d: "M18 14V16H20C20.55 16 21.0208 15.8042 21.4125 15.4125C21.8042 15.0208 22 14.55 22 14V4C22 3.45 21.8042 2.97917 21.4125 2.5875C21.0208 2.19583 20.55 2 20 2H10C9.45 2 8.97917 2.19583 8.5875 2.5875C8.19583 2.97917 8 3.45 8 4V6H10V4H20V14H18ZM14 22C14.55 22 15.0208 21.8042 15.4125 21.4125C15.8042 21.0208 16 20.55 16 20V10C16 9.45 15.8042 8.97917 15.4125 8.5875C15.0208 8.19583 14.55 8 14 8H4C3.45 8 2.97917 8.19583 2.5875 8.5875C2.19583 8.97917 2 9.45 2 10V20C2 20.55 2.19583 21.0208 2.5875 21.4125C2.97917 21.8042 3.45 22 4 22H14Z" }
     };
 
     // Flatten an SVG path `d` string into an array of subpaths, each an array
@@ -1768,12 +1888,19 @@ function buildDynamicPaletteModule(__host__, __status__) {
         if (type === "add") {
             strokeLine(g, pen, cx - 6, cy, cx + 6, cy);
             strokeLine(g, pen, cx, cy - 6, cx, cy + 6);
-        } else if (type === "extract") {
+        } else if (type === "pick") {
             strokeLine(g, pen, cx + 6, cy - 7, cx - 4, cy + 3);
             g.newPath();
             g.rectPath(cx + 4, cy - 9, 5, 5);
             g.strokePath(pen);
             strokeLine(g, pen, cx - 5, cy + 2, cx - 2, cy + 5);
+        } else if (type === "extract") {
+            g.newPath();
+            g.rectPath(cx - 8, cy - 6, 10, 12);
+            g.strokePath(pen);
+            strokeLine(g, pen, cx - 2, cy, cx + 8, cy);
+            strokeLine(g, pen, cx + 4, cy - 4, cx + 8, cy);
+            strokeLine(g, pen, cx + 4, cy + 4, cx + 8, cy);
         } else if (type === "import") {
             strokeLine(g, pen, cx, cy - 7, cx, cy + 2);
             strokeLine(g, pen, cx - 4, cy - 2, cx, cy + 2);
@@ -1934,6 +2061,19 @@ function buildDynamicPaletteModule(__host__, __status__) {
         addSwatch(color, "Swatch");
     }
 
+    // Grab a color with the eyedropper. Opens AE's color picker (forced native
+    // by pickColor), whose eyedropper tool samples any pixel on screen, and
+    // stores the result as a new swatch. ExtendScript has no API to sample a
+    // raw screen pixel directly, so the picker's built-in eyedropper is the
+    // route to a screen color.
+    function pickFromScreen() {
+        var color = pickColor(null);
+        if (!color) {
+            return;
+        }
+        addSwatch(color, "Picked");
+    }
+
     function setTargetMode(mode) {
         targetMode = mode;
         if (fillIconBtn) {
@@ -1989,84 +2129,142 @@ function buildDynamicPaletteModule(__host__, __status__) {
         win.spacing = 8;
         win.margins = 10;
 
-        var buttons = win.add("group");
-        buttons.orientation = "row";
-        buttons.alignment = ["fill", "top"];
-        buttons.alignChildren = ["left", "center"];
-        buttons.spacing = 4;
-        makeActionButton(buttons, "add", "Add Color", addColor);
-        makeActionButton(buttons, "extract", "Extract colors from selected layers", extractFromLayers);
-        makeActionButton(buttons, "import", "Import ASE palette (creates a new palette)", importAse);
-        removeBtn = makeActionButton(buttons, "remove", "Remove selected swatch", function () {
-            removeSwatch(selectedIndex);
+        // ===== Wrapping toolbars =====
+        // Three flow hosts: action buttons, the palette name/selector, and the
+        // fill/stroke/both + hex controls. Each wraps into extra rows when the
+        // panel is too narrow to hold its items on one line (see reflowToolbars).
+        var actionHost = win.add("group");
+        actionHost.orientation = "column";
+        actionHost.alignment = ["fill", "top"];
+        actionHost.alignChildren = ["left", "top"];
+        actionHost.spacing = 4;
+        actionHost.margins = 0;
+
+        var paletteHost = win.add("group");
+        paletteHost.orientation = "column";
+        paletteHost.alignment = ["fill", "top"];
+        paletteHost.alignChildren = ["left", "top"];
+        paletteHost.spacing = 4;
+        paletteHost.margins = 0;
+
+        var modeHost = win.add("group");
+        modeHost.orientation = "column";
+        modeHost.alignment = ["fill", "top"];
+        modeHost.alignChildren = ["left", "top"];
+        modeHost.spacing = 4;
+        modeHost.margins = 0;
+
+        var actionFlow = makeFlow(actionHost, 4);
+        actionFlow.add(34, function (row) {
+            makeActionButton(row, "extract", "Extract colors from selected layers", extractFromLayers);
         });
-        // Flexible spacer pushes the "clear" button to the right edge.
-        var btnSpacer = buttons.add("group");
-        btnSpacer.alignment = ["fill", "center"];
-        makeActionButton(buttons, "clear", "Clear all swatches in this palette", function () {
-            swatches = [];
-            selectedIndex = -1;
-            saveCurrentPalette();
-            rebuildSwatches();
+        actionFlow.add(34, function (row) {
+            makeActionButton(row, "add", "Add Color", addColor);
+        });
+        // Screen color picker hidden for now (eyedropper via AE's color picker).
+        actionFlow.add(34, function (row) {
+            makeActionButton(row, "import", "Import ASE palette (creates a new palette)", importAse);
+        });
+        actionFlow.add(34, function (row) {
+            removeBtn = makeActionButton(row, "remove", "Remove selected swatch", function () {
+                removeSwatch(selectedIndex);
+            });
+            updateButtonState();
+        });
+        // Divider + "clear all" travel together as one item so the divider
+        // never dangles at the end of a wrapped row.
+        actionFlow.add(47, function (row) {
+            var preGap = row.add("group");
+            preGap.minimumSize.width = 6;
+            preGap.maximumSize.width = 6;
+            var divider = row.add("group");
+            divider.minimumSize = [1, 22];
+            divider.maximumSize = [1, 22];
+            divider.onDraw = drawDivider;
+            var postGap = row.add("group");
+            postGap.minimumSize.width = 6;
+            postGap.maximumSize.width = 6;
+            makeActionButton(row, "clear", "Clear all swatches in this palette", function () {
+                swatches = [];
+                selectedIndex = -1;
+                saveCurrentPalette();
+                rebuildSwatches();
+            });
         });
 
-        var titleGroup = win.add("group");
-        titleGroup.orientation = "row";
-        titleGroup.alignChildren = ["left", "center"];
-        titleGroup.spacing = 6;
-        titleGroup.add("statictext", undefined, "Palette:");
-        titleField = titleGroup.add("edittext", undefined, paletteName);
-        titleField.preferredSize = [120, 24];
-        titleField.onChange = function () {
-            setPaletteName();
-        };
+        var paletteFlow = makeFlow(paletteHost, 6);
+        paletteFlow.add(46, function (row) {
+            row.add("statictext", undefined, "Palette:");
+        });
+        paletteFlow.add(120, function (row) {
+            titleField = row.add("edittext", undefined, paletteName);
+            titleField.preferredSize = [120, 24];
+            titleField.onChange = function () {
+                setPaletteName();
+            };
+        });
+        paletteFlow.add(120, function (row) {
+            paletteCombo = row.add("dropdownlist");
+            paletteCombo.preferredSize = [120, 24];
+            paletteCombo.onChange = function () {
+                if (this.selection) {
+                    switchPalette(this.selection.text);
+                }
+            };
+            refreshPaletteCombo();
+        });
 
-        paletteCombo = titleGroup.add("dropdownlist");
-        paletteCombo.preferredSize = [120, 24];
-        paletteCombo.onChange = function () {
-            if (this.selection) {
-                switchPalette(this.selection.text);
+        var modeFlow = makeFlow(modeHost, 8);
+        modeFlow.add(42, function (row) {
+            fillIconBtn = makeModeBtn(row, "fill", "Apply to Fill only");
+        });
+        modeFlow.add(42, function (row) {
+            strokeIconBtn = makeModeBtn(row, "stroke", "Apply to Stroke only");
+        });
+        modeFlow.add(42, function (row) {
+            bothIconBtn = makeModeBtn(row, "both", "Apply to Fill and Stroke");
+        });
+        modeFlow.add(30, function (row) {
+            row.add("statictext", undefined, "Hex:");
+        });
+        modeFlow.add(90, function (row) {
+            hexField = row.add("edittext", undefined, "");
+            hexField.preferredSize = [90, 24];
+            hexField.helpTip = "Hex of the selected swatch (editable)";
+            hexField.onChange = function () {
+                applyHexToSelected();
+            };
+            updateHexField();
+        });
+
+        function toolbarWidth() {
+            var w = 0;
+            try {
+                if (win.size && win.size[0]) { w = win.size[0]; }
+            } catch (eW) {}
+            w -= 20;
+            return w;
+        }
+
+        function reflowToolbars() {
+            if (reflowing) { return; }
+            reflowing = true;
+            var avail = toolbarWidth();
+            var changed = false;
+            if (actionFlow.reflow(avail)) { changed = true; }
+            if (paletteFlow.reflow(avail)) { changed = true; }
+            if (modeFlow.reflow(avail)) { changed = true; }
+            if (changed) {
+                setTargetMode(targetMode);
+                try { if (win.layout) { win.layout.layout(true); } } catch (eL) {}
             }
-        };
-
-        var modeGroup = win.add("group");
-        modeGroup.orientation = "row";
-        modeGroup.alignChildren = ["left", "center"];
-        modeGroup.spacing = 8;
-        fillIconBtn = modeGroup.add("iconbutton", undefined, undefined, { style: "toolbutton", toggle: true });
-        fillIconBtn.mode = "fill";
-        fillIconBtn.size = [42, 34];
-        fillIconBtn.preferredSize = [42, 34];
-        fillIconBtn.helpTip = "Apply to Fill only";
-        fillIconBtn.onDraw = drawTargetIcon;
-        fillIconBtn.onClick = function () { setTargetMode("fill"); };
-        strokeIconBtn = modeGroup.add("iconbutton", undefined, undefined, { style: "toolbutton", toggle: true });
-        strokeIconBtn.mode = "stroke";
-        strokeIconBtn.size = [42, 34];
-        strokeIconBtn.preferredSize = [42, 34];
-        strokeIconBtn.helpTip = "Apply to Stroke only";
-        strokeIconBtn.onDraw = drawTargetIcon;
-        strokeIconBtn.onClick = function () { setTargetMode("stroke"); };
-        bothIconBtn = modeGroup.add("iconbutton", undefined, undefined, { style: "toolbutton", toggle: true });
-        bothIconBtn.mode = "both";
-        bothIconBtn.size = [42, 34];
-        bothIconBtn.preferredSize = [42, 34];
-        bothIconBtn.helpTip = "Apply to Fill and Stroke";
-        bothIconBtn.onDraw = drawTargetIcon;
-        bothIconBtn.onClick = function () { setTargetMode("both"); };
-
-        modeGroup.add("statictext", undefined, "Hex:");
-        hexField = modeGroup.add("edittext", undefined, "");
-        hexField.preferredSize = [90, 24];
-        hexField.helpTip = "Hex of the selected swatch (editable)";
-        hexField.onChange = function () {
-            applyHexToSelected();
-        };
+            reflowing = false;
+        }
 
         swatchPanel = win.add("group");
         swatchPanel.orientation = "column";
         swatchPanel.alignChildren = ["left", "top"];
-        swatchPanel.alignment = ["fill", "fill"];
+        swatchPanel.alignment = ["fill", "top"];
         swatchPanel.spacing = 2;
         swatchPanel.margins = 0;
         // When the panel itself changes width (e.g. docked panel resized),
@@ -2076,40 +2274,64 @@ function buildDynamicPaletteModule(__host__, __status__) {
         swatchPanel.onResizing = swatchPanel.onResize = function () {
             if (reflowing) { return true; }
             reflowing = true;
-            try { rebuildSwatches(); } catch (eSwR) {}
+            try { rebuildSwatches(); relayoutTree(); } catch (eSwR) {}
             reflowing = false;
             return true;
         };
 
         statusText = __status__;
 
+        function relayoutTree() {
+            // Re-layout this host and every ancestor so that when the swatch
+            // grid gains or loses a row the sibling sections (e.g. the Tint /
+            // Split buttons) move back up instead of staying pushed down.
+            var node = win;
+            var top = win;
+            var guard = 0;
+            while (node && guard < 8) {
+                try { if (node.layout) { node.layout.layout(true); } } catch (eRL) {}
+                top = node;
+                node = node.parent;
+                guard++;
+            }
+            // layout(true) packs to the *preferred* (content) height, which
+            // leaves the flexible footer spacer collapsed. resize() on the top
+            // window redistributes the leftover room into the spring so the
+            // footer stays pinned to the bottom edge.
+            try { if (top && top.layout) { top.layout.resize(); } } catch (eRz) {}
+        }
+
         function reflowSwatches() {
             if (reflowing) {
                 return;
             }
             reflowing = true;
-            if (win.layout) {
-                win.layout.resize();
-            }
             rebuildSwatches();
+            relayoutTree();
             reflowing = false;
         }
 
         win.onResizing = win.onResize = function () {
+            reflowToolbars();
             reflowSwatches();
             return true;
         };
 
+        // Build the toolbars once so their controls exist before palette data
+        // is loaded into them, then load state.
+        reflowToolbars();
         loadPalette();
         setTargetMode(targetMode);
 
         if (win instanceof Window) {
             win.center();
             win.show();
+            reflowToolbars();
             reflowSwatches();
         } else {
             win.layout.layout(true);
             win.layout.resize();
+            reflowToolbars();
             reflowSwatches();
         }
         return win;
