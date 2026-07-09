@@ -14,7 +14,7 @@
 (function (thisObj) {
 
   var PANEL_TITLE = "Color\u2192Layer";
-  var PANEL_VERSION = "v0.8";
+  var PANEL_VERSION = "v0.16";
 
   var win = (thisObj instanceof Panel)
     ? thisObj
@@ -159,7 +159,7 @@
 
 function buildColorToLayerModule(__host__, __status__) {
 
-  var VERSION = "v0.8";
+  var VERSION = "v0.16";
 
   // ---------- helpers ----------
 
@@ -852,6 +852,11 @@ function buildDynamicPaletteModule(__host__, __status__) {
     var SETTINGS_NAME_KEY = "paletteName";
     var SETTINGS_PALETTES_KEY = "paletteNames";
     var SETTINGS_ACTIVE_KEY = "activePalette";
+    // Bumping DEFAULTS_VERSION clears the persisted palette cache ONCE on the
+    // next open and reinstalls getDefaultSwatches(), so shipped default colors
+    // actually reach existing installs (settings otherwise persist forever).
+    var SETTINGS_DEFAULTS_VERSION_KEY = "defaultsVersion";
+    var DEFAULTS_VERSION = "2";
     var CELL = 38;
     var COLUMNS = 6;
     var SEP_RECORD = "\u001E";
@@ -997,26 +1002,75 @@ function buildDynamicPaletteModule(__host__, __status__) {
     }
 
     function getDefaultSwatches() {
+        // Imported from grid-palette-2026-07-09.ase (Adobe Swatch Exchange).
         return [
-            { name: "Red", color: [1, 0.1, 0.1] },
-            { name: "Green", color: [0.1, 0.8, 0.2] },
-            { name: "Blue", color: [0.1, 0.4, 1] },
-            { name: "Yellow", color: [1, 0.9, 0.1] },
-            { name: "Magenta", color: [1, 0.2, 0.8] },
-            { name: "Cyan", color: [0.2, 0.8, 0.9] }
+            { type: "solid", name: "Brown", color: [0.403922, 0.262745, 0.164706] },
+            { type: "solid", name: "Red", color: [1, 0.003922, 0.003922] },
+            { type: "solid", name: "Orange", color: [1, 0.615686, 0] },
+            { type: "solid", name: "White", color: [1, 1, 1] }
         ];
+    }
+
+    // Clear the persisted palette cache ONCE per DEFAULTS_VERSION bump and
+    // reinstall the shipped default swatches, so new default colors reach
+    // existing installs whose AE settings would otherwise keep the old palette
+    // forever. Runs before the first loadPalette(); no-op once the stored marker
+    // matches, so a user's later edits are never wiped again.
+    function resetDefaultsIfNeeded() {
+        var stored = "";
+        try {
+            if (app.settings.haveSetting(SETTINGS_SECTION, SETTINGS_DEFAULTS_VERSION_KEY)) {
+                stored = app.settings.getSetting(SETTINGS_SECTION, SETTINGS_DEFAULTS_VERSION_KEY);
+            }
+        } catch (eGet) {}
+        if (stored === DEFAULTS_VERSION) {
+            return;
+        }
+        try {
+            var defaults = getDefaultSwatches();
+            app.settings.saveSetting(SETTINGS_SECTION, SETTINGS_PALETTES_KEY, "Main Palette");
+            app.settings.saveSetting(SETTINGS_SECTION, SETTINGS_ACTIVE_KEY, "Main Palette");
+            app.settings.saveSetting(SETTINGS_SECTION, SETTINGS_NAME_KEY, "Main Palette");
+            app.settings.saveSetting(SETTINGS_SECTION, getPaletteKey("Main Palette"), serializeSwatches(defaults));
+            app.settings.saveSetting(SETTINGS_SECTION, SETTINGS_DEFAULTS_VERSION_KEY, DEFAULTS_VERSION);
+        } catch (eSave) {}
     }
 
     function serializeSwatches(list) {
         var payload = [];
         for (var i = 0; i < list.length; i++) {
             var s = list[i];
-            payload.push([
-                sanitizeText(s.name || "Swatch"),
-                s.color[0],
-                s.color[1],
-                s.color[2]
-            ].join(SEP_FIELD));
+            if (isGradient(s)) {
+                var parts = ["G", sanitizeText(s.name || "Gradient"), s.gradType, s.stops.length];
+                var k;
+                for (k = 0; k < s.stops.length; k++) {
+                    var st = s.stops[k];
+                    parts.push(st.pos, (st.mid === undefined ? 0.5 : st.mid), st.r, st.g, st.b);
+                }
+                parts.push(s.alphaStops.length);
+                for (k = 0; k < s.alphaStops.length; k++) {
+                    var al = s.alphaStops[k];
+                    parts.push(al.pos, (al.mid === undefined ? 0.5 : al.mid), al.a);
+                }
+                // Geometry (direction + highlight), appended so older records
+                // still parse. Marker "GEO" then start x/y, end x/y, hlen, hang.
+                if (s.geom && s.geom.start && s.geom.end) {
+                    parts.push("GEO",
+                        s.geom.start[0], s.geom.start[1],
+                        s.geom.end[0], s.geom.end[1],
+                        (s.geom.hlen === undefined ? 0 : s.geom.hlen),
+                        (s.geom.hang === undefined ? 0 : s.geom.hang));
+                }
+                payload.push(parts.join(SEP_FIELD));
+            } else {
+                payload.push([
+                    "S",
+                    sanitizeText(s.name || "Swatch"),
+                    s.color[0],
+                    s.color[1],
+                    s.color[2]
+                ].join(SEP_FIELD));
+            }
         }
         return payload.join(SEP_RECORD);
     }
@@ -1029,15 +1083,81 @@ function buildDynamicPaletteModule(__host__, __status__) {
                 continue;
             }
             var fields = records[i].split(SEP_FIELD);
-            if (fields.length < 4) {
-                continue;
+            if (fields[0] === "G") {
+                var gs = parseGradientRecord(fields);
+                if (gs) {
+                    result.push(gs);
+                }
+            } else if (fields[0] === "S") {
+                if (fields.length < 5) {
+                    continue;
+                }
+                result.push({
+                    type: "solid",
+                    name: fields[1],
+                    color: [parseFloat(fields[2]), parseFloat(fields[3]), parseFloat(fields[4])]
+                });
+            } else {
+                // Legacy format (pre-gradient): name + r + g + b, no type token.
+                if (fields.length < 4) {
+                    continue;
+                }
+                result.push({
+                    type: "solid",
+                    name: fields[0],
+                    color: [parseFloat(fields[1]), parseFloat(fields[2]), parseFloat(fields[3])]
+                });
             }
-            result.push({
-                name: fields[0],
-                color: [parseFloat(fields[1]), parseFloat(fields[2]), parseFloat(fields[3])]
-            });
         }
         return result;
+    }
+
+    function parseGradientRecord(fields) {
+        // fields: G, name, gradType, N, (pos,mid,r,g,b)xN, M, (pos,mid,a)xM
+        if (fields.length < 4) {
+            return null;
+        }
+        var name = fields[1];
+        var gradType = Math.round(parseFloat(fields[2])) || 1;
+        var n = Math.round(parseFloat(fields[3]));
+        var idx = 4;
+        if (n < 1 || (idx + n * 5) > fields.length) {
+            return null;
+        }
+        var stops = [];
+        var k;
+        for (k = 0; k < n; k++) {
+            stops.push({
+                pos: parseFloat(fields[idx]), mid: parseFloat(fields[idx + 1]),
+                r: parseFloat(fields[idx + 2]), g: parseFloat(fields[idx + 3]), b: parseFloat(fields[idx + 4])
+            });
+            idx += 5;
+        }
+        var alphaStops = [];
+        var geom = null;
+        if (idx < fields.length) {
+            var m = Math.round(parseFloat(fields[idx])); idx += 1;
+            for (k = 0; k < m && (idx + 2) < fields.length + 1; k++) {
+                alphaStops.push({
+                    pos: parseFloat(fields[idx]), mid: parseFloat(fields[idx + 1]), a: parseFloat(fields[idx + 2])
+                });
+                idx += 3;
+            }
+        }
+        // Optional trailing geometry block: "GEO", startX, startY, endX, endY, hlen, hang.
+        if (idx < fields.length && fields[idx] === "GEO" && (idx + 6) < fields.length + 1) {
+            geom = {
+                start: [parseFloat(fields[idx + 1]), parseFloat(fields[idx + 2])],
+                end: [parseFloat(fields[idx + 3]), parseFloat(fields[idx + 4])],
+                hlen: parseFloat(fields[idx + 5]),
+                hang: parseFloat(fields[idx + 6])
+            };
+            idx += 7;
+        }
+        if (!alphaStops.length) {
+            alphaStops = [{ pos: 0, mid: 0.5, a: 1 }, { pos: 1, mid: 0.5, a: 1 }];
+        }
+        return { type: "gradient", name: name, gradType: gradType, stops: stops, alphaStops: alphaStops, geom: geom };
     }
 
     function listContains(list, value) {
@@ -1222,19 +1342,837 @@ function buildDynamicPaletteModule(__host__, __status__) {
             Math.round(a[2] * 100) === Math.round(b[2] * 100);
     }
 
+    // ---------- Gradient support ----------
+    //
+    // AE stores a Gradient Fill / Stroke's stops in the "ADBE Vector Grad
+    // Colors" property as a flat numeric array (PropertyValueType.CUSTOM_VALUE):
+    //
+    //   [ N,                                   // color-stop count
+    //     pos, mid, r, g, b,  (x N)            // each color stop, 0..1
+    //     M,                                   // alpha-stop count
+    //     pos, mid, a,        (x M) ]          // each alpha stop, 0..1
+    //
+    // `mid` is the relative position (0..1) of the blend midpoint diamond
+    // toward the next stop (0.5 = centered). Everything is 0..1, not 0..255.
+    var GRAD_FILL_MATCH = "ADBE Vector Graphic - G-Fill";
+    var GRAD_STROKE_MATCH = "ADBE Vector Graphic - G-Stroke";
+    var GRAD_COLORS_MATCH = "ADBE Vector Grad Colors";
+    var GRAD_TYPE_MATCH = "ADBE Vector Grad Type";
+    var GRAD_START_MATCH = "ADBE Vector Grad Start Pt";
+    var GRAD_END_MATCH = "ADBE Vector Grad End Pt";
+    var GRAD_HLEN_MATCH = "ADBE Vector Grad HiLite Length";
+    var GRAD_HANG_MATCH = "ADBE Vector Grad HiLite Angle";
+    var STROKE_WIDTH_MATCH = "ADBE Vector Stroke Width";
+    var GRAD_DEBUG = false;
+    var gradDebugLog = [];
+    var savedProjectStr;   // cached .aep text (sentinel: undefined = not read yet)
+
+    function isGradient(sw) {
+        return sw && sw.type === "gradient";
+    }
+
+    // ===== Gradient stop colours via saved-project parsing =====
+    //
+    // "ADBE Vector Grad Colors" is a NO_VALUE property in AE's scripting model
+    // (.value / .keyValue() throw). The only way to read the stop colours is to
+    // open the SAVED project file as text and pull the <prop.map> XML block AE
+    // serialises after each "ADBE Vector Grad Colors" occurrence. Ported from
+    // the Lottie-HTML AE→HTML exporter (itself a port of Bodymovin's
+    // ProjectParser.getGradientData). The project MUST be saved; colours come
+    // from the last saved state.
+
+    // Read the saved project file as one text string (cached). BINARY encoding
+    // so a binary .aep isn't truncated at its first null byte; the embedded
+    // <prop.map> ASCII fragments stay searchable.
+    function readSavedProjectString() {
+        if (savedProjectStr !== undefined) {
+            return savedProjectStr;
+        }
+        savedProjectStr = null;
+        try {
+            var ff = app.project ? app.project.file : null;
+            if (ff) {
+                var f = new File(ff.absoluteURI);
+                f.encoding = "BINARY";
+                if (f.open("r")) {
+                    savedProjectStr = f.read();
+                    f.close();
+                }
+            }
+        } catch (e) {
+            savedProjectStr = null;
+        }
+        return savedProjectStr;
+    }
+
+    function resetSavedProjectCache() {
+        savedProjectStr = undefined;
+    }
+
+    // Position a search cursor just past a name path ([compName, layerName,
+    // ...groupNames]). AE serialises each name as a length-prefixed "Utf8"
+    // declaration; match that exact declaration and take the nearest one after
+    // the parent. Falls back to a name+"LIST" heuristic for older AE / .aepx.
+    function aepFindNav(fileString, nav) {
+        var navigationIndex = 0;
+        for (var i = 0; i < nav.length; i++) {
+            if (nav[i] === null || nav[i] === undefined || nav[i] === "") {
+                continue;
+            }
+            var name = String(nav[i]);
+            var utf8 = unescape(encodeURIComponent(name));
+            var len = utf8.length;
+            var marker = "Utf8"
+                + String.fromCharCode((len >> 24) & 0xff, (len >> 16) & 0xff, (len >> 8) & 0xff, len & 0xff)
+                + utf8;
+            var idx = fileString.indexOf(marker, navigationIndex + 1);
+            if (idx !== -1) {
+                navigationIndex = idx + marker.length;
+                continue;
+            }
+            var encoded = unescape(encodeURIComponent(name + "LIST"));
+            idx = fileString.indexOf(encoded, navigationIndex + 1);
+            if (idx === -1) {
+                encoded = unescape(encodeURIComponent(name + " LIST"));
+                idx = fileString.indexOf(encoded, navigationIndex + 1);
+            }
+            if (idx === -1) {
+                encoded = utf8;
+                idx = fileString.indexOf(encoded, navigationIndex + 1);
+            }
+            if (idx !== -1) {
+                navigationIndex = idx;
+            }
+        }
+        return navigationIndex;
+    }
+
+    // Pull the numbers out of one <array>…</array> block. The
+    // <array.type><float/></array.type> header's self-closing <float/> has no
+    // text, so the <float>X</float> pattern skips it automatically.
+    function aepExtractFloats(arrayBlock) {
+        var floats = [];
+        var re = /<float>([^<]*)<\/float>/g;
+        var m;
+        while ((m = re.exec(arrayBlock)) !== null) {
+            floats.push(Number(m[1]));
+        }
+        return floats;
+    }
+
+    // Collect the float arrays for every stop carrying `valueKey` ("Stops
+    // Color" / "Stops Alpha") within a region, in document order.
+    function aepParseStopList(region, valueKey) {
+        var stops = [];
+        if (!region) {
+            return stops;
+        }
+        var marker = "<key>" + valueKey + "</key>";
+        var idx = region.indexOf(marker);
+        while (idx !== -1) {
+            var aStart = region.indexOf("<array>", idx);
+            if (aStart === -1) {
+                break;
+            }
+            var aEnd = region.indexOf("</array>", aStart);
+            if (aEnd === -1) {
+                break;
+            }
+            stops.push(aepExtractFloats(region.substr(aStart, aEnd - aStart)));
+            idx = region.indexOf(marker, aEnd);
+        }
+        return stops;
+    }
+
+    // Split one gradient <prop.map> block into raw colour + alpha stop arrays.
+    // Colour entries: [offset, midpoint, R, G, B]; alpha: [offset, midpoint, a].
+    function aepParsePropMap(block) {
+        var colorKeyIdx = block.indexOf("<key>Color Stops</key>");
+        var alphaKeyIdx = block.indexOf("<key>Alpha Stops</key>");
+        var colorRegion = (colorKeyIdx !== -1) ? block.substr(colorKeyIdx) : "";
+        var alphaRegion = "";
+        if (alphaKeyIdx !== -1) {
+            alphaRegion = (colorKeyIdx !== -1 && colorKeyIdx > alphaKeyIdx)
+                ? block.substr(alphaKeyIdx, colorKeyIdx - alphaKeyIdx)
+                : block.substr(alphaKeyIdx);
+        }
+        return {
+            colors: aepParseStopList(colorRegion, "Stops Color"),
+            alphas: aepParseStopList(alphaRegion, "Stops Alpha")
+        };
+    }
+
+    // Read the static gradient stops for the container at name-path `nav` from
+    // the saved project. Returns {stops:[{pos,mid,r,g,b}], alphaStops:[{pos,mid,a}]}
+    // or null when unavailable.
+    function readGradientStopsFromAep(nav) {
+        var fileString = readSavedProjectString();
+        if (!fileString) {
+            if (GRAD_DEBUG) { gradDebugLog.push("no saved project string (project unsaved?)"); }
+            return null;
+        }
+        if (fileString.indexOf(GRAD_COLORS_MATCH) === -1) {
+            if (GRAD_DEBUG) { gradDebugLog.push("no Grad Colors marker in project file"); }
+            return null;
+        }
+        try {
+            var navigationIndex = aepFindNav(fileString, nav || []);
+            var gradientIndex = fileString.indexOf(GRAD_COLORS_MATCH, navigationIndex);
+            if (gradientIndex === -1) {
+                gradientIndex = fileString.indexOf(GRAD_COLORS_MATCH);
+                if (gradientIndex === -1) {
+                    return null;
+                }
+            }
+            var mapStart = fileString.indexOf("<prop.map", gradientIndex);
+            if (mapStart === -1) {
+                if (GRAD_DEBUG) { gradDebugLog.push("no <prop.map> after Grad Colors"); }
+                return null;
+            }
+            var endMatch = "</prop.map>";
+            var mapEnd = fileString.indexOf(endMatch, mapStart);
+            if (mapEnd === -1) {
+                return null;
+            }
+            var block = fileString.substr(mapStart, mapEnd + endMatch.length - mapStart);
+            var parsed = aepParsePropMap(block);
+            var rawColors = parsed.colors;   // [[offset, mid, R, G, B], …]
+            var rawAlphas = parsed.alphas;   // [[offset, mid, a], …]
+            if (GRAD_DEBUG) {
+                var rawDump = [];
+                for (var rc = 0; rc < rawColors.length; rc++) { rawDump.push("[" + rawColors[rc].join(",") + "]"); }
+                gradDebugLog.push("raw color stops = " + rawDump.join(" "));
+            }
+            if (!rawColors.length) {
+                if (GRAD_DEBUG) { gradDebugLog.push("prop.map had no colour stops"); }
+                return null;
+            }
+            var stops = [];
+            var i;
+            for (i = 0; i < rawColors.length; i++) {
+                var c = rawColors[i];
+                stops.push({
+                    pos: num01(c[0]), mid: (c[1] === undefined ? 0.5 : num01(c[1])),
+                    r: num01(c[2]), g: num01(c[3]), b: num01(c[4])
+                });
+            }
+            stops.sort(sortByPos);
+            var alphaStops = [];
+            for (i = 0; i < rawAlphas.length; i++) {
+                var a = rawAlphas[i];
+                alphaStops.push({
+                    pos: num01(a[0]), mid: (a[1] === undefined ? 0.5 : num01(a[1])),
+                    a: num01(a[2])
+                });
+            }
+            alphaStops.sort(sortByPos);
+            if (!alphaStops.length) {
+                alphaStops = [{ pos: 0, mid: 0.5, a: 1 }, { pos: 1, mid: 0.5, a: 1 }];
+            }
+            if (GRAD_DEBUG) {
+                var posList = [];
+                for (var dbg = 0; dbg < stops.length; dbg++) { posList.push(stops[dbg].pos); }
+                gradDebugLog.push("aep parse OK: " + stops.length + " stops, " + alphaStops.length + " alpha; color offsets = [" + posList.join(", ") + "]");
+            }
+            return { stops: stops, alphaStops: alphaStops };
+        } catch (eParse) {
+            if (GRAD_DEBUG) { gradDebugLog.push("aep parse threw: " + eParse.toString()); }
+            return null;
+        }
+    }
+
+    function num01(v) {
+        var n = Number(v);
+        if (isNaN(n)) {
+            return 0;
+        }
+        return n;
+    }
+
+    function sortByPos(a, b) {
+        if (a.pos === b.pos) {
+            return 0;
+        }
+        return (a.pos < b.pos) ? -1 : 1;
+    }
+
+    // ===== Gradient WRITE via .ffx animation-preset injection =====
+    //
+    // "ADBE Vector Grad Colors" is NO_VALUE, so setValue can't write the stop
+    // colours. The one technique that works in pure ExtendScript (used by
+    // AEUX / Overlord) is to build an animation preset (.ffx) that carries the
+    // stop colours in its <prop.map> XML and apply it with layer.applyPreset().
+    //
+    // GRAD_FFX_B64 is a real "Colors"-only preset captured from AE, base64'd.
+    // We decode it, swap its <prop.map> XML for one built from the swatch's
+    // stops, patch the RIFX chunk sizes, write a temp .ffx and applyPreset it
+    // onto the target gradient's Colors property. The skeleton is independent
+    // of stop count (the XML carries every stop), so one template covers 2..N.
+
+    var GRAD_FFX_B64 = "UklGWAAAFGZGYUZYaGVhZAAAABAAAAADAAAAYAAAAAkAAAAATElTVAAAFEJiZXNjYmVzbwAAADgAAAABAAAAAQAAFAAAAHgAADwA"
+        + "AAAAAAQAAQABAgACAD/wAAAAAAAAP/AAAAAAAAAAAAAA/////0xJU1QAAAE8dGRzcHRkb3QAAAAE/////3RkcGwAAAAEAAAABExJ"
+        + "U1QAAABAdGRzaXRkaXgAAAAE/////3RkbW4AAAAoQURCRSBSb290IFZlY3RvcnMgR3JvdXAAAAAAAAAAAAAAAAAAAAAAAExJU1QA"
+        + "AABAdGRzaXRkaXgAAAAEAAAAAHRkbW4AAAAoQURCRSBWZWN0b3IgR3JvdXAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAExJU1QAAABA"
+        + "dGRzaXRkaXgAAAAE/////3RkbW4AAAAoQURCRSBWZWN0b3JzIEdyb3VwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAExJU1QAAABAdGRz"
+        + "aXRkaXgAAAAEAAAAAXRkbW4AAAAoQURCRSBWZWN0b3IgR3JhcGhpYyAtIEctRmlsbAAAAAAAAAAAAAAAAHRkc24AAAAYVXRmOAAA"
+        + "AA9HcmFkaWVudCBGaWxsIDEATElTVAAAAGR0ZHNwdGRvdAAAAAT/////dGRwbAAAAAQAAAABTElTVAAAAEB0ZHNpdGRpeAAAAAT/"
+        + "////dGRtbgAAAChBREJFIEVuZCBvZiBwYXRoIHNlbnRpbmVsAAAAAAAAAAAAAAAAAAAATElTVAAAEiZ0ZGdwdGRzYgAAAAQAAAAB"
+        + "dGRzbgAAABhVdGY4AAAAD0dyYWRpZW50IEZpbGwgMQB0ZG1uAAAAKEFEQkUgVmVjdG9yIEJsZW5kIE1vZGUAAAAAAAAAAAAAAAAA"
+        + "AAAAAABMSVNUAAAA2nRkYnN0ZHNiAAAABAAAAAN0ZHNuAAAADlV0ZjgAAAAGLV8wXy8tdGRiNAAAAHzbmQABAAEAAAACAAAAAHgA"
+        + "Pxo24uscQy0/8AAAAAAAAD/wAAAAAAAAP/AAAAAAAAA/8AAAAAAAAAAAAAQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY2RhdAAAACg/8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        + "AAAAAAAAdGRtbgAAAChBREJFIFZlY3RvciBDb21wb3NpdGUgT3JkZXIAAAAAAAAAAAAAAAAATElTVAAAANp0ZGJzdGRzYgAAAAQA"
+        + "AAABdGRzbgAAAA5VdGY4AAAABi1fMF8vLXRkYjQAAAB825kAAQABAAAAAgAAAAB4AD8aNuLrHEMtP/AAAAAAAAA/8AAAAAAAAD/w"
+        + "AAAAAAAAP/AAAAAAAAAAAAAEBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        + "AAAAAAAAAGNkYXQAAAAoP/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHRkbW4AAAAoQURCRSBWZWN0b3Ig"
+        + "RmlsbCBSdWxlAAAAAAAAAAAAAAAAAAAAAAAAAExJU1QAAADadGRic3Rkc2IAAAAEAAAAAXRkc24AAAAOVXRmOAAAAAYtXzBfLy10"
+        + "ZGI0AAAAfNuZAAEAAQAAAAIAAAAAeAA/Gjbi6xxDLT/wAAAAAAAAP/AAAAAAAAA/8AAAAAAAAD/wAAAAAAAAAAAABAQAAAAAAAAA"
+        + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABjZGF0AAAAKD/wAAAAAAAAAAAA"
+        + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB0ZG1uAAAAKEFEQkUgVmVjdG9yIEdyYWQgVHlwZQAAAAAAAAAAAAAAAAAAAAAA"
+        + "AABMSVNUAAAA2nRkYnN0ZHNiAAAABAAAAAF0ZHNuAAAADlV0ZjgAAAAGLV8wXy8tdGRiNAAAAHzbmQABAAEAAAACAAAAAHgAPxo2"
+        + "4uscQy0/8AAAAAAAAD/wAAAAAAAAP/AAAAAAAAA/8AAAAAAAAAAAAAQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY2RhdAAAACg/8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        + "AAAAdGRtbgAAAChBREJFIFZlY3RvciBHcmFkIFN0YXJ0IFB0AAAAAAAAAAAAAAAAAAAATElTVAAAAOJ0ZGJzdGRzYgAAAAQAAAAB"
+        + "dGRzbgAAAA5VdGY4AAAABi1fMF8vLXRkYjQAAAB825kAAgAPAAP/////AAB4AD8aNuLrHEMtP/AAAAAAAAA/8AAAAAAAAD/wAAAA"
+        + "AAAAP/AAAAAAAAAAAAAICQAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        + "AAAAAGNkYXQAAAAwwFU4bQAAAADARH8rAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAdGRtbgAAAChBREJFIFZl"
+        + "Y3RvciBHcmFkIEVuZCBQdAAAAAAAAAAAAAAAAAAAAAAATElTVAAAAOJ0ZGJzdGRzYgAAAAQAAAABdGRzbgAAAA5VdGY4AAAABi1f"
+        + "MF8vLXRkYjQAAAB825kAAgAPAAP/////AAB4AD8aNuLrHEMtP/AAAAAAAAA/8AAAAAAAAD/wAAAAAAAAP/AAAAAAAAAAAAAICQAA"
+        + "AAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGNkYXQAAAAwQGD3TqAA"
+        + "AABAXaokgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAdGRtbgAAAChBREJFIFZlY3RvciBHcmFkIEhpTGl0ZSBM"
+        + "ZW5ndGgAAAAAAAAAAAAATElTVAAAAPp0ZGJzdGRzYgAAAAQAAAADdGRzbgAAAA5VdGY4AAAABi1fMF8vLXRkYjQAAAB825kAAQAB"
+        + "AAD/////AAB4AD8aNuLrHEMtP/AAAAAAAAA/8AAAAAAAAD/wAAAAAAAAP/AAAAAAAAAAAAAECAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGNkYXQAAAAoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        + "AAAAAAAAAAAAAAAAAAAAAHRkdW0AAAAIwFkAAAAAAAB0ZHVNAAAACEBZAAAAAAAAdGRtbgAAAChBREJFIFZlY3RvciBHcmFkIEhp"
+        + "TGl0ZSBBbmdsZQAAAAAAAAAAAAAATElTVAAAANp0ZGJzdGRzYgAAAAQAAAADdGRzbgAAAA5VdGY4AAAABi1fMF8vLXRkYjQAAAB8"
+        + "25kAAQABAAAAAv//AAB4AD8aNuLrHEMtP/AAAAAAAAA/8AAAAAAAAD/wAAAAAAAAP/AAAAAAAAAAAAAICQAAAAAAAAAAAAAAAAAA"
+        + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGNkYXQAAAAoAAAAAAAAAAAAAAAAAAAAAAAA"
+        + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAHRkbW4AAAAoQURCRSBWZWN0b3IgR3JhZCBDb2xvcnMAAAAAAAAAAAAAAAAAAAAAAExJU1QA"
+        + "AAecR0NzdExJU1QAAAC2dGRic3Rkc2IAAAAEAAAAAXRkc24AAAAOVXRmOAAAAAYtXzBfLy10ZGI0AAAAfNuZAAEABwAA/////wAA"
+        + "eAA/Gjbi6xxDLT/wAAAAAAAAP/AAAAAAAAA/8AAAAAAAAD/wAAAAAAAAAAEACAAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAA"
+        + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABjZGF0AAAABAAAAABMSVNUAAAG0kdDa3lVdGY4AAAGxTw/eG1sIHZl"
+        + "cnNpb249JzEuMCc/Pgo8cHJvcC5tYXAgdmVyc2lvbj0nNCc+Cjxwcm9wLmxpc3Q+Cjxwcm9wLnBhaXI+CjxrZXk+R3JhZGllbnQg"
+        + "Q29sb3IgRGF0YTwva2V5Pgo8cHJvcC5saXN0Pgo8cHJvcC5wYWlyPgo8a2V5PkFscGhhIFN0b3BzPC9rZXk+Cjxwcm9wLmxpc3Q+"
+        + "Cjxwcm9wLnBhaXI+CjxrZXk+U3RvcHMgTGlzdDwva2V5Pgo8cHJvcC5saXN0Pgo8cHJvcC5wYWlyPgo8a2V5PlN0b3AtMDwva2V5"
+        + "Pgo8cHJvcC5saXN0Pgo8cHJvcC5wYWlyPgo8a2V5PlN0b3BzIEFscGhhPC9rZXk+CjxhcnJheT4KPGFycmF5LnR5cGU+PGZsb2F0"
+        + "Lz48L2FycmF5LnR5cGU+CjxmbG9hdD4wPC9mbG9hdD4KPGZsb2F0PjAuNTwvZmxvYXQ+CjxmbG9hdD4xPC9mbG9hdD4KPC9hcnJh"
+        + "eT4KPC9wcm9wLnBhaXI+CjwvcHJvcC5saXN0Pgo8L3Byb3AucGFpcj4KPHByb3AucGFpcj4KPGtleT5TdG9wLTE8L2tleT4KPHBy"
+        + "b3AubGlzdD4KPHByb3AucGFpcj4KPGtleT5TdG9wcyBBbHBoYTwva2V5Pgo8YXJyYXk+CjxhcnJheS50eXBlPjxmbG9hdC8+PC9h"
+        + "cnJheS50eXBlPgo8ZmxvYXQ+MTwvZmxvYXQ+CjxmbG9hdD4wLjU8L2Zsb2F0Pgo8ZmxvYXQ+MTwvZmxvYXQ+CjwvYXJyYXk+Cjwv"
+        + "cHJvcC5wYWlyPgo8L3Byb3AubGlzdD4KPC9wcm9wLnBhaXI+CjwvcHJvcC5saXN0Pgo8L3Byb3AucGFpcj4KPHByb3AucGFpcj4K"
+        + "PGtleT5TdG9wcyBTaXplPC9rZXk+CjxpbnQgdHlwZT0ndW5zaWduZWQnIHNpemU9JzMyJz4yPC9pbnQ+CjwvcHJvcC5wYWlyPgo8"
+        + "L3Byb3AubGlzdD4KPC9wcm9wLnBhaXI+Cjxwcm9wLnBhaXI+CjxrZXk+Q29sb3IgU3RvcHM8L2tleT4KPHByb3AubGlzdD4KPHBy"
+        + "b3AucGFpcj4KPGtleT5TdG9wcyBMaXN0PC9rZXk+Cjxwcm9wLmxpc3Q+Cjxwcm9wLnBhaXI+CjxrZXk+U3RvcC0wPC9rZXk+Cjxw"
+        + "cm9wLmxpc3Q+Cjxwcm9wLnBhaXI+CjxrZXk+U3RvcHMgQ29sb3I8L2tleT4KPGFycmF5Pgo8YXJyYXkudHlwZT48ZmxvYXQvPjwv"
+        + "YXJyYXkudHlwZT4KPGZsb2F0PjA8L2Zsb2F0Pgo8ZmxvYXQ+MC41PC9mbG9hdD4KPGZsb2F0PjAuMzYwNzg0MzI8L2Zsb2F0Pgo8"
+        + "ZmxvYXQ+MC41NTI5NDEyPC9mbG9hdD4KPGZsb2F0PjAuOTcyNTQ5MDg8L2Zsb2F0Pgo8ZmxvYXQ+MTwvZmxvYXQ+CjwvYXJyYXk+"
+        + "CjwvcHJvcC5wYWlyPgo8L3Byb3AubGlzdD4KPC9wcm9wLnBhaXI+Cjxwcm9wLnBhaXI+CjxrZXk+U3RvcC0xPC9rZXk+Cjxwcm9w"
+        + "Lmxpc3Q+Cjxwcm9wLnBhaXI+CjxrZXk+U3RvcHMgQ29sb3I8L2tleT4KPGFycmF5Pgo8YXJyYXkudHlwZT48ZmxvYXQvPjwvYXJy"
+        + "YXkudHlwZT4KPGZsb2F0PjE8L2Zsb2F0Pgo8ZmxvYXQ+MC41PC9mbG9hdD4KPGZsb2F0PjAuMTYwNzg0MzI8L2Zsb2F0Pgo8Zmxv"
+        + "YXQ+MC4yNjY2NjY2ODwvZmxvYXQ+CjxmbG9hdD4wLjUwOTgwMzk1PC9mbG9hdD4KPGZsb2F0PjE8L2Zsb2F0Pgo8L2FycmF5Pgo8"
+        + "L3Byb3AucGFpcj4KPC9wcm9wLmxpc3Q+CjwvcHJvcC5wYWlyPgo8L3Byb3AubGlzdD4KPC9wcm9wLnBhaXI+Cjxwcm9wLnBhaXI+"
+        + "CjxrZXk+U3RvcHMgU2l6ZTwva2V5Pgo8aW50IHR5cGU9J3Vuc2lnbmVkJyBzaXplPSczMic+MjwvaW50Pgo8L3Byb3AucGFpcj4K"
+        + "PC9wcm9wLmxpc3Q+CjwvcHJvcC5wYWlyPgo8L3Byb3AubGlzdD4KPC9wcm9wLnBhaXI+Cjxwcm9wLnBhaXI+CjxrZXk+R3JhZGll"
+        + "bnQgQ29sb3JzPC9rZXk+CjxzdHJpbmc+MS4wPC9zdHJpbmc+CjwvcHJvcC5wYWlyPgo8L3Byb3AubGlzdD4KPC9wcm9wLm1hcD4K"
+        + "AHRkbW4AAAAoQURCRSBWZWN0b3IgRmlsbCBPcGFjaXR5AAAAAAAAAAAAAAAAAAAAAExJU1QAAAD6dGRic3Rkc2IAAAAEAAAAAXRk"
+        + "c24AAAAOVXRmOAAAAAYtXzBfLy10ZGI0AAAAfNuZAAEAAQAA/////wAAeAA/Gjbi6xxDLT/wAAAAAAAAP/AAAAAAAAA/8AAAAAAA"
+        + "AD/wAAAAAAAAAAAABAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        + "AABjZGF0AAAAKEBZAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB0ZHVtAAAACAAAAAAAAAAAdGR1TQAAAAhA"
+        + "WQAAAAAAAHRkbW4AAAAoQURCRSBHcm91cCBFbmQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADw/eHBhY2tldCBiZWdpbj0i77u/"
+        + "IiBpZD0iVzVNME1wQ2VoaUh6cmVTek5UY3prYzlkIj8+Cjx4OnhtcG1ldGEgeG1sbnM6eD0iYWRvYmU6bnM6bWV0YS8iIHg6eG1w"
+        + "dGs9IkFkb2JlIFhNUCBDb3JlIDkuMS1jMDAzIDc5Ljk2OTBhODcsIDIwMjUvMDMvMDYtMTk6MTI6MDMgICAgICAgICI+CiAgIDxy"
+        + "ZGY6UkRGIHhtbG5zOnJkZj0iaHR0cDovL3d3dy53My5vcmcvMTk5OS8wMi8yMi1yZGYtc3ludGF4LW5zIyI+CiAgICAgIDxyZGY6"
+        + "RGVzY3JpcHRpb24gcmRmOmFib3V0PSIiCiAgICAgICAgICAgIHhtbG5zOmRjPSJodHRwOi8vcHVybC5vcmcvZGMvZWxlbWVudHMv"
+        + "MS4xLyIKICAgICAgICAgICAgeG1sbnM6eG1wPSJodHRwOi8vbnMuYWRvYmUuY29tL3hhcC8xLjAvIgogICAgICAgICAgICB4bWxu"
+        + "czp4bXBNTT0iaHR0cDovL25zLmFkb2JlLmNvbS94YXAvMS4wL21tLyIKICAgICAgICAgICAgeG1sbnM6c3RFdnQ9Imh0dHA6Ly9u"
+        + "cy5hZG9iZS5jb20veGFwLzEuMC9zVHlwZS9SZXNvdXJjZUV2ZW50IyI+CiAgICAgICAgIDxkYzpmb3JtYXQ+YXBwbGljYXRpb24v"
+        + "dm5kLmFkb2JlLmFmdGVyZWZmZWN0cy5wcmVzZXQtYW5pbWF0aW9uPC9kYzpmb3JtYXQ+CiAgICAgICAgIDx4bXA6Q3JlYXRvclRv"
+        + "b2w+QWRvYmUgQWZ0ZXIgRWZmZWN0cyAyMDI1IChNYWNpbnRvc2gpPC94bXA6Q3JlYXRvclRvb2w+CiAgICAgICAgIDx4bXA6Q3Jl"
+        + "YXRlRGF0ZT4yMDI2LTA3LTA5VDEzOjQ0OjAxLTAzOjAwPC94bXA6Q3JlYXRlRGF0ZT4KICAgICAgICAgPHhtcDpNZXRhZGF0YURh"
+        + "dGU+MjAyNi0wNy0wOVQxMzo0NDowMS0wMzowMDwveG1wOk1ldGFkYXRhRGF0ZT4KICAgICAgICAgPHhtcDpNb2RpZnlEYXRlPjIw"
+        + "MjYtMDctMDlUMTM6NDQ6MDEtMDM6MDA8L3htcDpNb2RpZnlEYXRlPgogICAgICAgICA8eG1wTU06SW5zdGFuY2VJRD54bXAuaWlk"
+        + "OjdiZjI1NjIwLTBkMGMtNDA1OS05ZWY2LTRmYzQwNTE1NGIzZDwveG1wTU06SW5zdGFuY2VJRD4KICAgICAgICAgPHhtcE1NOkRv"
+        + "Y3VtZW50SUQ+eG1wLmRpZDo3YmYyNTYyMC0wZDBjLTQwNTktOWVmNi00ZmM0MDUxNTRiM2Q8L3htcE1NOkRvY3VtZW50SUQ+CiAg"
+        + "ICAgICAgIDx4bXBNTTpPcmlnaW5hbERvY3VtZW50SUQ+eG1wLmRpZDo3YmYyNTYyMC0wZDBjLTQwNTktOWVmNi00ZmM0MDUxNTRi"
+        + "M2Q8L3htcE1NOk9yaWdpbmFsRG9jdW1lbnRJRD4KICAgICAgICAgPHhtcE1NOkhpc3Rvcnk+CiAgICAgICAgICAgIDxyZGY6U2Vx"
+        + "PgogICAgICAgICAgICAgICA8cmRmOmxpIHJkZjpwYXJzZVR5cGU9IlJlc291cmNlIj4KICAgICAgICAgICAgICAgICAgPHN0RXZ0"
+        + "OmFjdGlvbj5jcmVhdGVkPC9zdEV2dDphY3Rpb24+CiAgICAgICAgICAgICAgICAgIDxzdEV2dDppbnN0YW5jZUlEPnhtcC5paWQ6"
+        + "N2JmMjU2MjAtMGQwYy00MDU5LTllZjYtNGZjNDA1MTU0YjNkPC9zdEV2dDppbnN0YW5jZUlEPgogICAgICAgICAgICAgICAgICA8"
+        + "c3RFdnQ6d2hlbj4yMDI2LTA3LTA5VDEzOjQ0OjAxLTAzOjAwPC9zdEV2dDp3aGVuPgogICAgICAgICAgICAgICAgICA8c3RFdnQ6"
+        + "c29mdHdhcmVBZ2VudD5BZG9iZSBBZnRlciBFZmZlY3RzIDIwMjUgKE1hY2ludG9zaCk8L3N0RXZ0OnNvZnR3YXJlQWdlbnQ+CiAg"
+        + "ICAgICAgICAgICAgIDwvcmRmOmxpPgogICAgICAgICAgICA8L3JkZjpTZXE+CiAgICAgICAgIDwveG1wTU06SGlzdG9yeT4KICAg"
+        + "ICAgPC9yZGY6RGVzY3JpcHRpb24+CiAgIDwvcmRmOlJERj4KPC94OnhtcG1ldGE+CiAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAK"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAKPD94"
+        + "cGFja2V0IGVuZD0idyI/Pg==";
+
+    // Stroke gradients need their OWN preset: applyPreset matches the full
+    // parent chain (...G-Fill vs ...G-Stroke), so the fill template can't be
+    // reused for a stroke's Colors. Capture a "Gradient Stroke > Colors" preset
+    // the same way and paste its base64 here to enable stroke gradients.
+    var GRAD_FFX_STROKE_B64 = "UklGWAAACe5GYUZYaGVhZAAAABAAAAADAAAAYAAAAAkAAAAATElTVAAACcpiZXNjYmVzbwAAADgAAAABAAAAAQAAAAAAAHgAAB4A"
+        + "AAAAAAQAAQABBDgEOD/wAAAAAAAAP/AAAAAAAAAAAAAA/////0xJU1QAAAGEdGRzcHRkb3QAAAAE/////3RkcGwAAAAEAAAABUxJ"
+        + "U1QAAABAdGRzaXRkaXgAAAAE/////3RkbW4AAAAoQURCRSBSb290IFZlY3RvcnMgR3JvdXAAAAAAAAAAAAAAAAAAAAAAAExJU1QA"
+        + "AABAdGRzaXRkaXgAAAAEAAAAAHRkbW4AAAAoQURCRSBWZWN0b3IgR3JvdXAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAExJU1QAAABA"
+        + "dGRzaXRkaXgAAAAE/////3RkbW4AAAAoQURCRSBWZWN0b3JzIEdyb3VwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAExJU1QAAABAdGRz"
+        + "aXRkaXgAAAAEAAAAAXRkbW4AAAAoQURCRSBWZWN0b3IgR3JhcGhpYyAtIEctU3Ryb2tlAAAAAAAAAAAAAExJU1QAAABAdGRzaXRk"
+        + "aXgAAAAE/////3RkbW4AAAAoQURCRSBWZWN0b3IgR3JhZCBDb2xvcnMAAAAAAAAAAAAAAAAAAAAAAHRkc24AAAAOVXRmOAAAAAZD"
+        + "b2xvcnNMSVNUAAAAZHRkc3B0ZG90AAAABP////90ZHBsAAAABAAAAAFMSVNUAAAAQHRkc2l0ZGl4AAAABP////90ZG1uAAAAKEFE"
+        + "QkUgRW5kIG9mIHBhdGggc2VudGluZWwAAAAAAAAAAAAAAAAAAABMSVNUAAAHcEdDc3RMSVNUAAAAtnRkYnN0ZHNiAAAABAAAAAF0"
+        + "ZHNuAAAADlV0ZjgAAAAGQ29sb3JzdGRiNAAAAHzbmQABAAcAAP////8AAHgAPxo24uscQy0/8AAAAAAAAD/wAAAAAAAAP/AAAAAA"
+        + "AAA/8AAAAAAAAAABAAgAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        + "AAAAY2RhdAAAAAQAAAAATElTVAAABqZHQ2t5VXRmOAAABpk8P3htbCB2ZXJzaW9uPScxLjAnPz4KPHByb3AubWFwIHZlcnNpb249"
+        + "JzQnPgo8cHJvcC5saXN0Pgo8cHJvcC5wYWlyPgo8a2V5PkdyYWRpZW50IENvbG9yIERhdGE8L2tleT4KPHByb3AubGlzdD4KPHBy"
+        + "b3AucGFpcj4KPGtleT5BbHBoYSBTdG9wczwva2V5Pgo8cHJvcC5saXN0Pgo8cHJvcC5wYWlyPgo8a2V5PlN0b3BzIExpc3Q8L2tl"
+        + "eT4KPHByb3AubGlzdD4KPHByb3AucGFpcj4KPGtleT5TdG9wLTA8L2tleT4KPHByb3AubGlzdD4KPHByb3AucGFpcj4KPGtleT5T"
+        + "dG9wcyBBbHBoYTwva2V5Pgo8YXJyYXk+CjxhcnJheS50eXBlPjxmbG9hdC8+PC9hcnJheS50eXBlPgo8ZmxvYXQ+MDwvZmxvYXQ+"
+        + "CjxmbG9hdD4wLjU8L2Zsb2F0Pgo8ZmxvYXQ+MTwvZmxvYXQ+CjwvYXJyYXk+CjwvcHJvcC5wYWlyPgo8L3Byb3AubGlzdD4KPC9w"
+        + "cm9wLnBhaXI+Cjxwcm9wLnBhaXI+CjxrZXk+U3RvcC0xPC9rZXk+Cjxwcm9wLmxpc3Q+Cjxwcm9wLnBhaXI+CjxrZXk+U3RvcHMg"
+        + "QWxwaGE8L2tleT4KPGFycmF5Pgo8YXJyYXkudHlwZT48ZmxvYXQvPjwvYXJyYXkudHlwZT4KPGZsb2F0PjE8L2Zsb2F0Pgo8Zmxv"
+        + "YXQ+MC41PC9mbG9hdD4KPGZsb2F0PjE8L2Zsb2F0Pgo8L2FycmF5Pgo8L3Byb3AucGFpcj4KPC9wcm9wLmxpc3Q+CjwvcHJvcC5w"
+        + "YWlyPgo8L3Byb3AubGlzdD4KPC9wcm9wLnBhaXI+Cjxwcm9wLnBhaXI+CjxrZXk+U3RvcHMgU2l6ZTwva2V5Pgo8aW50IHR5cGU9"
+        + "J3Vuc2lnbmVkJyBzaXplPSczMic+MjwvaW50Pgo8L3Byb3AucGFpcj4KPC9wcm9wLmxpc3Q+CjwvcHJvcC5wYWlyPgo8cHJvcC5w"
+        + "YWlyPgo8a2V5PkNvbG9yIFN0b3BzPC9rZXk+Cjxwcm9wLmxpc3Q+Cjxwcm9wLnBhaXI+CjxrZXk+U3RvcHMgTGlzdDwva2V5Pgo8"
+        + "cHJvcC5saXN0Pgo8cHJvcC5wYWlyPgo8a2V5PlN0b3AtMDwva2V5Pgo8cHJvcC5saXN0Pgo8cHJvcC5wYWlyPgo8a2V5PlN0b3Bz"
+        + "IENvbG9yPC9rZXk+CjxhcnJheT4KPGFycmF5LnR5cGU+PGZsb2F0Lz48L2FycmF5LnR5cGU+CjxmbG9hdD4wPC9mbG9hdD4KPGZs"
+        + "b2F0PjAuNTwvZmxvYXQ+CjxmbG9hdD4xPC9mbG9hdD4KPGZsb2F0PjA8L2Zsb2F0Pgo8ZmxvYXQ+MDwvZmxvYXQ+CjxmbG9hdD4x"
+        + "PC9mbG9hdD4KPC9hcnJheT4KPC9wcm9wLnBhaXI+CjwvcHJvcC5saXN0Pgo8L3Byb3AucGFpcj4KPHByb3AucGFpcj4KPGtleT5T"
+        + "dG9wLTE8L2tleT4KPHByb3AubGlzdD4KPHByb3AucGFpcj4KPGtleT5TdG9wcyBDb2xvcjwva2V5Pgo8YXJyYXk+CjxhcnJheS50"
+        + "eXBlPjxmbG9hdC8+PC9hcnJheS50eXBlPgo8ZmxvYXQ+MTwvZmxvYXQ+CjxmbG9hdD4wLjU8L2Zsb2F0Pgo8ZmxvYXQ+MDwvZmxv"
+        + "YXQ+CjxmbG9hdD4wLjM3ODg2MDIxPC9mbG9hdD4KPGZsb2F0PjE8L2Zsb2F0Pgo8ZmxvYXQ+MTwvZmxvYXQ+CjwvYXJyYXk+Cjwv"
+        + "cHJvcC5wYWlyPgo8L3Byb3AubGlzdD4KPC9wcm9wLnBhaXI+CjwvcHJvcC5saXN0Pgo8L3Byb3AucGFpcj4KPHByb3AucGFpcj4K"
+        + "PGtleT5TdG9wcyBTaXplPC9rZXk+CjxpbnQgdHlwZT0ndW5zaWduZWQnIHNpemU9JzMyJz4yPC9pbnQ+CjwvcHJvcC5wYWlyPgo8"
+        + "L3Byb3AubGlzdD4KPC9wcm9wLnBhaXI+CjwvcHJvcC5saXN0Pgo8L3Byb3AucGFpcj4KPHByb3AucGFpcj4KPGtleT5HcmFkaWVu"
+        + "dCBDb2xvcnM8L2tleT4KPHN0cmluZz4xLjA8L3N0cmluZz4KPC9wcm9wLnBhaXI+CjwvcHJvcC5saXN0Pgo8L3Byb3AubWFwPgoA"
+        + "PD94cGFja2V0IGJlZ2luPSLvu78iIGlkPSJXNU0wTXBDZWhpSHpyZVN6TlRjemtjOWQiPz4KPHg6eG1wbWV0YSB4bWxuczp4PSJh"
+        + "ZG9iZTpuczptZXRhLyIgeDp4bXB0az0iQWRvYmUgWE1QIENvcmUgOS4xLWMwMDMgNzkuOTY5MGE4NywgMjAyNS8wMy8wNi0xOTox"
+        + "MjowMyAgICAgICAgIj4KICAgPHJkZjpSREYgeG1sbnM6cmRmPSJodHRwOi8vd3d3LnczLm9yZy8xOTk5LzAyLzIyLXJkZi1zeW50"
+        + "YXgtbnMjIj4KICAgICAgPHJkZjpEZXNjcmlwdGlvbiByZGY6YWJvdXQ9IiIKICAgICAgICAgICAgeG1sbnM6ZGM9Imh0dHA6Ly9w"
+        + "dXJsLm9yZy9kYy9lbGVtZW50cy8xLjEvIgogICAgICAgICAgICB4bWxuczp4bXA9Imh0dHA6Ly9ucy5hZG9iZS5jb20veGFwLzEu"
+        + "MC8iCiAgICAgICAgICAgIHhtbG5zOnhtcE1NPSJodHRwOi8vbnMuYWRvYmUuY29tL3hhcC8xLjAvbW0vIgogICAgICAgICAgICB4"
+        + "bWxuczpzdEV2dD0iaHR0cDovL25zLmFkb2JlLmNvbS94YXAvMS4wL3NUeXBlL1Jlc291cmNlRXZlbnQjIj4KICAgICAgICAgPGRj"
+        + "OmZvcm1hdD5hcHBsaWNhdGlvbi92bmQuYWRvYmUuYWZ0ZXJlZmZlY3RzLnByZXNldC1hbmltYXRpb248L2RjOmZvcm1hdD4KICAg"
+        + "ICAgICAgPHhtcDpDcmVhdG9yVG9vbD5BZG9iZSBBZnRlciBFZmZlY3RzIDIwMjUgKE1hY2ludG9zaCk8L3htcDpDcmVhdG9yVG9v"
+        + "bD4KICAgICAgICAgPHhtcDpDcmVhdGVEYXRlPjIwMjYtMDctMDlUMTQ6NTA6MjItMDM6MDA8L3htcDpDcmVhdGVEYXRlPgogICAg"
+        + "ICAgICA8eG1wOk1ldGFkYXRhRGF0ZT4yMDI2LTA3LTA5VDE0OjUwOjIyLTAzOjAwPC94bXA6TWV0YWRhdGFEYXRlPgogICAgICAg"
+        + "ICA8eG1wOk1vZGlmeURhdGU+MjAyNi0wNy0wOVQxNDo1MDoyMi0wMzowMDwveG1wOk1vZGlmeURhdGU+CiAgICAgICAgIDx4bXBN"
+        + "TTpJbnN0YW5jZUlEPnhtcC5paWQ6MmQxNDFmYmQtZDc5NS00MGRiLWE0MGYtYmZlYzEwOTJkYzU0PC94bXBNTTpJbnN0YW5jZUlE"
+        + "PgogICAgICAgICA8eG1wTU06RG9jdW1lbnRJRD54bXAuZGlkOjJkMTQxZmJkLWQ3OTUtNDBkYi1hNDBmLWJmZWMxMDkyZGM1NDwv"
+        + "eG1wTU06RG9jdW1lbnRJRD4KICAgICAgICAgPHhtcE1NOk9yaWdpbmFsRG9jdW1lbnRJRD54bXAuZGlkOjJkMTQxZmJkLWQ3OTUt"
+        + "NDBkYi1hNDBmLWJmZWMxMDkyZGM1NDwveG1wTU06T3JpZ2luYWxEb2N1bWVudElEPgogICAgICAgICA8eG1wTU06SGlzdG9yeT4K"
+        + "ICAgICAgICAgICAgPHJkZjpTZXE+CiAgICAgICAgICAgICAgIDxyZGY6bGkgcmRmOnBhcnNlVHlwZT0iUmVzb3VyY2UiPgogICAg"
+        + "ICAgICAgICAgICAgICA8c3RFdnQ6YWN0aW9uPmNyZWF0ZWQ8L3N0RXZ0OmFjdGlvbj4KICAgICAgICAgICAgICAgICAgPHN0RXZ0"
+        + "Omluc3RhbmNlSUQ+eG1wLmlpZDoyZDE0MWZiZC1kNzk1LTQwZGItYTQwZi1iZmVjMTA5MmRjNTQ8L3N0RXZ0Omluc3RhbmNlSUQ+"
+        + "CiAgICAgICAgICAgICAgICAgIDxzdEV2dDp3aGVuPjIwMjYtMDctMDlUMTQ6NTA6MjItMDM6MDA8L3N0RXZ0OndoZW4+CiAgICAg"
+        + "ICAgICAgICAgICAgIDxzdEV2dDpzb2Z0d2FyZUFnZW50PkFkb2JlIEFmdGVyIEVmZmVjdHMgMjAyNSAoTWFjaW50b3NoKTwvc3RF"
+        + "dnQ6c29mdHdhcmVBZ2VudD4KICAgICAgICAgICAgICAgPC9yZGY6bGk+CiAgICAgICAgICAgIDwvcmRmOlNlcT4KICAgICAgICAg"
+        + "PC94bXBNTTpIaXN0b3J5PgogICAgICA8L3JkZjpEZXNjcmlwdGlvbj4KICAgPC9yZGY6UkRGPgo8L3g6eG1wbWV0YT4KICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAKICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAK"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAg"
+        + "ICAgICAgICAgICAgICAgIAo8P3hwYWNrZXQgZW5kPSJ3Ij8+";
+
+    var ffxTemplateFill;       // cached decoded fill template (binary string)
+    var ffxTemplateStroke;     // cached decoded stroke template (binary string)
+    var gradApplyMsg = "";     // status message set by the apply path
+
+    function ffxDecodeB64(b64) {
+        var chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        var out = "", i = 0, e1, e2, e3, e4, ch3, ch4;
+        b64 = b64.replace(/[^A-Za-z0-9\+\/\=]/g, "");
+        while (i < b64.length) {
+            ch3 = b64.charAt(i + 2);
+            ch4 = b64.charAt(i + 3);
+            e1 = chars.indexOf(b64.charAt(i)); i++;
+            e2 = chars.indexOf(b64.charAt(i)); i++;
+            e3 = (ch3 === "=") ? 64 : chars.indexOf(b64.charAt(i)); i++;
+            e4 = (ch4 === "=") ? 64 : chars.indexOf(b64.charAt(i)); i++;
+            out += String.fromCharCode((e1 << 2) | (e2 >> 4));
+            if (e3 !== 64) { out += String.fromCharCode(((e2 & 15) << 4) | (e3 >> 2)); }
+            if (e4 !== 64) { out += String.fromCharCode(((e3 & 3) << 6) | e4); }
+        }
+        return out;
+    }
+
+    function ffxReadU32(s, o) {
+        return s.charCodeAt(o) * 16777216 + s.charCodeAt(o + 1) * 65536 +
+               s.charCodeAt(o + 2) * 256 + s.charCodeAt(o + 3);
+    }
+
+    function ffxU32Str(n) {
+        var b0 = Math.floor(n / 16777216) % 256;
+        var b1 = Math.floor(n / 65536) % 256;
+        var b2 = Math.floor(n / 256) % 256;
+        var b3 = n % 256;
+        return String.fromCharCode(b0) + String.fromCharCode(b1) +
+               String.fromCharCode(b2) + String.fromCharCode(b3);
+    }
+
+    function ffxFmtFloat(x) {
+        var s = x.toFixed(8);
+        s = s.replace(/0+$/, "").replace(/\.$/, "");
+        if (s === "" || s === "-0") { s = "0"; }
+        return s;
+    }
+
+    function ffxFloatTag(v) { return "<float>" + ffxFmtFloat(v) + "</float>\n"; }
+
+    // Build the <prop.map> XML for the given stops. Colour stop array =
+    // [offset, midpoint, R, G, B, 1.0]; alpha stop = [offset, midpoint, opacity].
+    function ffxBuildXml(stops, alphaStops) {
+        var i, cstr = "", astr = "";
+        for (i = 0; i < alphaStops.length; i++) {
+            var a = alphaStops[i];
+            var am = (a.mid === undefined ? 0.5 : a.mid);
+            astr += "<prop.pair>\n<key>Stop-" + i + "</key>\n<prop.list>\n<prop.pair>\n<key>Stops Alpha</key>\n"
+                + "<array>\n<array.type><float/></array.type>\n"
+                + ffxFloatTag(a.pos) + ffxFloatTag(am) + ffxFloatTag(a.a)
+                + "</array>\n</prop.pair>\n</prop.list>\n</prop.pair>\n";
+        }
+        for (i = 0; i < stops.length; i++) {
+            var s = stops[i];
+            var sm = (s.mid === undefined ? 0.5 : s.mid);
+            cstr += "<prop.pair>\n<key>Stop-" + i + "</key>\n<prop.list>\n<prop.pair>\n<key>Stops Color</key>\n"
+                + "<array>\n<array.type><float/></array.type>\n"
+                + ffxFloatTag(s.pos) + ffxFloatTag(sm) + ffxFloatTag(s.r) + ffxFloatTag(s.g) + ffxFloatTag(s.b) + ffxFloatTag(1)
+                + "</array>\n</prop.pair>\n</prop.list>\n</prop.pair>\n";
+        }
+        return "<?xml version='1.0'?>\n<prop.map version='4'>\n<prop.list>\n<prop.pair>\n"
+            + "<key>Gradient Color Data</key>\n<prop.list>\n<prop.pair>\n<key>Alpha Stops</key>\n<prop.list>\n"
+            + "<prop.pair>\n<key>Stops List</key>\n<prop.list>\n" + astr + "</prop.list>\n</prop.pair>\n"
+            + "<prop.pair>\n<key>Stops Size</key>\n<int type='unsigned' size='32'>" + alphaStops.length + "</int>\n</prop.pair>\n</prop.list>\n</prop.pair>\n"
+            + "<prop.pair>\n<key>Color Stops</key>\n<prop.list>\n"
+            + "<prop.pair>\n<key>Stops List</key>\n<prop.list>\n" + cstr + "</prop.list>\n</prop.pair>\n"
+            + "<prop.pair>\n<key>Stops Size</key>\n<int type='unsigned' size='32'>" + stops.length + "</int>\n</prop.pair>\n</prop.list>\n</prop.pair>\n"
+            + "</prop.list>\n</prop.pair>\n<prop.pair>\n<key>Gradient Colors</key>\n<string>1.0</string>\n</prop.pair>\n</prop.list>\n</prop.map>\n";
+    }
+
+    // Find the Utf8 chunk whose body is the <?xml ...> prop.map.
+    function ffxFindXmlChunk(s) {
+        var i = s.indexOf("Utf8");
+        while (i !== -1) {
+            if (s.substr(i + 8, 5) === "<?xml") { return i; }
+            i = s.indexOf("Utf8", i + 1);
+        }
+        return -1;
+    }
+
+    // Collect the size-field offsets of every chunk whose data range contains
+    // the XML chunk (its RIFX ancestors) — these grow/shrink with the XML.
+    function ffxAncestorSizeFields(s, target, uoff) {
+        var res = [];
+        function walk(off, end) {
+            while (off + 8 <= end) {
+                var ct = s.substr(off, 4);
+                var sz = ffxReadU32(s, off + 4);
+                var body = off + 8;
+                if (body <= target && target < body + sz && off !== uoff) {
+                    res.push(off + 4);
+                }
+                if (ct === "RIFX" || ct === "LIST") { walk(body + 4, body + sz); }
+                off = body + sz + (sz & 1);
+            }
+        }
+        walk(0, 8 + ffxReadU32(s, 4));
+        return res;
+    }
+
+    // Build a complete .ffx binary string carrying the swatch's stop colours.
+    function ffxGenerate(stops, alphaStops, isFill) {
+        var tmpl;
+        if (isFill) {
+            if (ffxTemplateFill === undefined) {
+                ffxTemplateFill = GRAD_FFX_B64 ? ffxDecodeB64(GRAD_FFX_B64) : "";
+            }
+            tmpl = ffxTemplateFill;
+        } else {
+            if (ffxTemplateStroke === undefined) {
+                ffxTemplateStroke = GRAD_FFX_STROKE_B64 ? ffxDecodeB64(GRAD_FFX_STROKE_B64) : "";
+            }
+            tmpl = ffxTemplateStroke;
+        }
+        if (!tmpl) { return null; }
+        var uoff = ffxFindXmlChunk(tmpl);
+        if (uoff === -1) { return null; }
+        var usize = ffxReadU32(tmpl, uoff + 4);
+        var ubody = uoff + 8;
+        var anc = ffxAncestorSizeFields(tmpl, ubody, uoff);
+        var alphas = (alphaStops && alphaStops.length)
+            ? alphaStops : [{ pos: 0, mid: 0.5, a: 1 }, { pos: 1, mid: 0.5, a: 1 }];
+        var newXml = ffxBuildXml(stops, alphas);
+        var oldPad = usize & 1, newSize = newXml.length, newPad = newSize & 1;
+        var ancDelta = (newSize + newPad) - (usize + oldPad);
+        var s = tmpl.substr(0, uoff + 4) + ffxU32Str(newSize) + tmpl.substr(uoff + 8);
+        var k;
+        for (k = 0; k < anc.length; k++) {
+            var cur = ffxReadU32(s, anc[k]);
+            s = s.substr(0, anc[k]) + ffxU32Str(cur + ancDelta) + s.substr(anc[k] + 4);
+        }
+        var pad = newPad ? String.fromCharCode(0) : "";
+        s = s.substr(0, ubody) + newXml + pad + s.substr(ubody + usize + oldPad);
+        return s;
+    }
+
+    // Write a binary string to a temp .ffx file. Returns the File or null.
+    function ffxWriteTemp(binStr) {
+        try {
+            var f = new File(Folder.temp.fsName + "/c2l_grad_" + (new Date()).getTime() + ".ffx");
+            f.encoding = "BINARY";
+            if (!f.open("w")) { return null; }
+            var ok = f.write(binStr);
+            f.close();
+            return ok ? f : null;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // Apply the swatch's stop colours to a gradient's Colors property by
+    // building a temp .ffx and applyPreset-ing it. isFill picks the fill vs
+    // stroke template (their parent chains differ). Returns true on success.
+    function ffxApplyColors(layer, colorsProp, sw, isFill) {
+        if (GRAD_DEBUG) {
+            var ap = [];
+            for (var d = 0; d < sw.stops.length; d++) { ap.push(sw.stops[d].pos); }
+            gradDebugLog.push("APPLY " + (isFill ? "fill" : "stroke") + ": swatch offsets = [" + ap.join(", ") + "]");
+        }
+        var bin = ffxGenerate(sw.stops, sw.alphaStops, isFill);
+        if (!bin) {
+            gradApplyMsg = "Couldn't build gradient preset.";
+            return false;
+        }
+        var file = ffxWriteTemp(bin);
+        if (!file) {
+            gradApplyMsg = "Enable Preferences > Scripting & Expressions > Allow Scripts to Write Files, then retry.";
+            return false;
+        }
+        var applied = false;
+        try {
+            var comp = layer.containingComp;
+            var prev = comp ? comp.selectedProperties : null;
+            var i;
+            if (prev) {
+                for (i = 0; i < prev.length; i++) {
+                    try { prev[i].selected = false; } catch (eD) {}
+                }
+            }
+            try { colorsProp.selected = true; } catch (eSel) {}
+            layer.applyPreset(file);
+            applied = true;
+        } catch (eApply) {
+            gradApplyMsg = "applyPreset failed: " + eApply.toString();
+            applied = false;
+        }
+        try { file.remove(); } catch (eRm) {}
+        return applied;
+    }
+
+    // Read a gradient swatch payload {gradType, stops, alphaStops, geom} from a
+    // gradient fill/stroke. The gradient TYPE and geometry (start/end points =
+    // direction, highlight) are scriptable, but the stop COLORS are a NO_VALUE
+    // property — those are read from the saved project file via
+    // readGradientStopsFromAep, located by the container's name path.
+    function readGradientFromContainer(container, kind, nav) {
+        if (!container || !container.property) {
+            return null;
+        }
+        var typeProp = null;
+        try { typeProp = container.property(GRAD_TYPE_MATCH); } catch (eT) {}
+        var parsed = readGradientStopsFromAep(nav);
+        if (!parsed) {
+            return null;
+        }
+        var gradType = 1;
+        try { if (typeProp) { gradType = Math.round(typeProp.value) || 1; } } catch (eGT) {}
+        return {
+            type: "gradient",
+            kind: kind,
+            gradType: gradType,
+            stops: parsed.stops,
+            alphaStops: parsed.alphaStops,
+            geom: readGradientGeometry(container)
+        };
+    }
+
+    // Read a gradient's DIRECTION + highlight (the scriptable geometry we want a
+    // swatch to reproduce): start point [x,y], end point [x,y], highlight length
+    // and angle. Returns null if start/end are unavailable, so applying a swatch
+    // without geometry (e.g. an older saved one) leaves the shape's own
+    // direction untouched. Stroke width is NOT captured — it belongs to the
+    // stroke, not the color, and is preserved separately on apply.
+    function readGradientGeometry(container) {
+        var g = {};
+        var got = false;
+        var pairs = [
+            ["start", GRAD_START_MATCH],
+            ["end", GRAD_END_MATCH],
+            ["hlen", GRAD_HLEN_MATCH],
+            ["hang", GRAD_HANG_MATCH]
+        ];
+        for (var i = 0; i < pairs.length; i++) {
+            var p = null;
+            try { p = container.property(pairs[i][1]); } catch (eP) { p = null; }
+            if (!p) { continue; }
+            try {
+                if (p.numKeys > 0) { continue; }
+                g[pairs[i][0]] = p.value;
+                if (pairs[i][0] === "start" || pairs[i][0] === "end") { got = true; }
+            } catch (eV) {}
+        }
+        return got ? g : null;
+    }
+
+    // Walk the shape tree collecting gradient fill/stroke containers, tracking
+    // the name path (comp → layer → group names) each one lives under so its
+    // colours can be located in the saved .aep. Only "ADBE Vector Group" named
+    // shape groups contribute a name segment (matching AE's serialisation).
+    function collectGradientContainers(group, out, nav) {
+        for (var i = 1; i <= group.numProperties; i++) {
+            var prop = group.property(i);
+            if (!prop) {
+                continue;
+            }
+            if (prop.matchName === GRAD_FILL_MATCH) {
+                out.push({ container: prop, kind: "fill", nav: nav });
+            } else if (prop.matchName === GRAD_STROKE_MATCH) {
+                out.push({ container: prop, kind: "stroke", nav: nav });
+            } else if (prop.matchName === "ADBE Vector Group") {
+                var gName = "";
+                try { gName = prop.name; } catch (eGn) {}
+                var childNav = gName ? nav.concat([gName]) : nav;
+                collectGradientContainers(prop, out, childNav);
+            } else if (prop.propertyType === PropertyType.INDEXED_GROUP ||
+                       prop.propertyType === PropertyType.NAMED_GROUP) {
+                collectGradientContainers(prop, out, nav);
+            }
+        }
+    }
+
+    function getGradientContainersForLayer(layer, comp) {
+        var out = [];
+        if (!layer || !layer.property) {
+            return out;
+        }
+        var root = layer.property("ADBE Root Vectors Group");
+        if (!root) {
+            return out;
+        }
+        var compName = "";
+        var layerName = "";
+        try { compName = comp ? comp.name : ""; } catch (eCn) {}
+        try { layerName = layer.name; } catch (eLn) {}
+        collectGradientContainers(root, out, [compName, layerName]);
+        return out;
+    }
+
+    // Sample a gradient's color-stop list at t in [0,1] for on-screen preview.
+    // Linear interpolation between the two surrounding stops (midpoint diamond
+    // ignored — close enough for a 38px chip).
+    function gradientColorAt(stops, t) {
+        if (!stops || !stops.length) {
+            return [0.5, 0.5, 0.5];
+        }
+        if (t <= stops[0].pos) {
+            return [stops[0].r, stops[0].g, stops[0].b];
+        }
+        var last = stops[stops.length - 1];
+        if (t >= last.pos) {
+            return [last.r, last.g, last.b];
+        }
+        for (var i = 0; i < stops.length - 1; i++) {
+            var a = stops[i], b = stops[i + 1];
+            if (t >= a.pos && t <= b.pos) {
+                var span = b.pos - a.pos;
+                var f = span > 0 ? (t - a.pos) / span : 0;
+                return [
+                    a.r + (b.r - a.r) * f,
+                    a.g + (b.g - a.g) * f,
+                    a.b + (b.b - a.b) * f
+                ];
+            }
+        }
+        return [last.r, last.g, last.b];
+    }
+
+    // Signature used to dedupe gradient swatches on extract.
+    function gradientSignature(sw) {
+        var parts = [sw.gradType];
+        var i;
+        for (i = 0; i < sw.stops.length; i++) {
+            var s = sw.stops[i];
+            parts.push(Math.round(s.pos * 1000), Math.round(s.r * 255),
+                Math.round(s.g * 255), Math.round(s.b * 255));
+        }
+        for (i = 0; i < sw.alphaStops.length; i++) {
+            var a = sw.alphaStops[i];
+            parts.push("a", Math.round(a.pos * 1000), Math.round(a.a * 255));
+        }
+        return parts.join(",");
+    }
+
+
     function addSwatch(color, label) {
         if (!color) {
             return;
         }
         for (var i = 0; i < swatches.length; i++) {
-            if (colorMatches(swatches[i].color, color)) {
+            if (!isGradient(swatches[i]) && colorMatches(swatches[i].color, color)) {
                 selectedIndex = i;
                 rebuildSwatches();
                 updateStatus();
                 return;
             }
         }
-        swatches.push({ name: label || "Swatch", color: color });
+        swatches.push({ type: "solid", name: label || "Swatch", color: color });
         selectedIndex = swatches.length - 1;
         saveCurrentPalette();
         rebuildSwatches();
@@ -1284,7 +2222,7 @@ function buildDynamicPaletteModule(__host__, __status__) {
         return out;
     }
 
-    function getTargetProperties(layer) {
+    function getSelectedColorProps(layer) {
         var selected = layer.selectedProperties || [];
         var selectedColorProps = [];
         for (var i = 0; i < selected.length; i++) {
@@ -1297,50 +2235,185 @@ function buildDynamicPaletteModule(__host__, __status__) {
                 selectedColorProps.push({ property: prop, kind: prop.matchName === "ADBE Vector Fill Color" ? "fill" : "stroke" });
             }
         }
-        if (selectedColorProps.length) {
-            return selectedColorProps;
-        }
-        var allProps = getColorPropertiesForLayer(layer);
-        if (targetMode === "fill" || targetMode === "stroke") {
-            var filtered = [];
-            for (var j = 0; j < allProps.length; j++) {
-                if (allProps[j] && allProps[j].kind === targetMode) {
-                    filtered.push(allProps[j]);
-                }
-            }
-            return filtered;
-        }
-        return allProps;
+        return selectedColorProps;
     }
 
+    function setSolidColorProp(layer, prop, color) {
+        if (!prop || !prop.canSetExpression) {
+            return;
+        }
+        var value = arrayToColor(color);
+        if (prop.numKeys > 0) {
+            var comp = layer.containingComp;
+            var time = comp ? comp.time : 0;
+            prop.setValueAtTime(time, value);
+        } else {
+            prop.setValue(value);
+        }
+    }
+
+    // Apply a solid swatch to a layer. Honors an explicit Fill/Stroke color
+    // selection; otherwise, for each wanted kind (per targetMode), makes the
+    // shape end up with a solid of `color`: it sets existing solids, removes any
+    // gradient of that kind, and creates a solid if the shape has none.
     function applyColorToLayer(layer, color) {
         if (!layer || !layer.property || !color) {
             return false;
         }
-        var props = getTargetProperties(layer);
-        if (!props.length) {
+        var root = layer.property("ADBE Root Vectors Group");
+        if (!root) {
             return false;
         }
+        var applied = false;
         app.beginUndoGroup("Apply vector swatch");
         try {
-            for (var i = 0; i < props.length; i++) {
-                var entry = props[i];
-                if (entry && entry.property && entry.property.canSetExpression) {
-                    var prop = entry.property;
-                    var value = arrayToColor(color);
-                    if (prop.numKeys > 0) {
-                        var comp = layer.containingComp;
-                        var time = comp ? comp.time : 0;
-                        prop.setValueAtTime(time, value);
-                    } else {
-                        prop.setValue(value);
-                    }
+            var selected = getSelectedColorProps(layer);
+            if (selected.length) {
+                for (var s = 0; s < selected.length; s++) {
+                    setSolidColorProp(layer, selected[s].property, color);
+                    applied = true;
                 }
+            } else {
+                var wantFill = (targetMode === "fill" || targetMode === "both");
+                var wantStroke = (targetMode === "stroke" || targetMode === "both");
+                if (wantFill && applySolidForKind(layer, root, color, true)) { applied = true; }
+                if (wantStroke && applySolidForKind(layer, root, color, false)) { applied = true; }
             }
         } finally {
             app.endUndoGroup();
         }
-        return true;
+        return applied;
+    }
+
+    // Ensure the shape carries a solid Fill / Stroke of `color` for one kind:
+    //   1. Set the color on every existing solid of that kind.
+    //   2. Remove every gradient of that kind (a solid swatch must beat the
+    //      gradient it's covering).
+    //   3. If the shape had neither a solid nor a gradient of that kind, create
+    //      a fresh solid so applying a color to a bare shape still shows up.
+    function applySolidForKind(layer, root, color, isFill) {
+        var did = false;
+        var all = getColorPropertiesForLayer(layer);
+        var i;
+        for (i = 0; i < all.length; i++) {
+            if (all[i] && all[i].kind === (isFill ? "fill" : "stroke") && all[i].property) {
+                setSolidColorProp(layer, all[i].property, color);
+                did = true;
+            }
+        }
+        var grads = getGradientContainersForLayer(layer, layer.containingComp);
+        var hadGrad = false;
+        var gradLook = null;
+        for (i = 0; i < grads.length; i++) {
+            if (grads[i].kind !== (isFill ? "fill" : "stroke")) {
+                continue;
+            }
+            hadGrad = true;
+            // Carry the gradient's width/opacity/other params onto the solid
+            // that replaces it, so converting a gradient to a solid changes only
+            // the color (a solid shares Stroke Width / opacity matchNames).
+            if (gradLook === null) { gradLook = readGradientAppearance(grads[i].container); }
+            var parent = null;
+            try { parent = grads[i].container.parentProperty; } catch (eP) {}
+            try { grads[i].container.remove(); } catch (eR) {}
+            if (!did) {
+                if (createSolidGraphic(layer, parent, color, isFill, gradLook)) { did = true; }
+            }
+        }
+        if (!did && !hadGrad) {
+            if (createSolidGraphic(layer, findShapeContents(root) || root, color, isFill, null)) { did = true; }
+        }
+        return did;
+    }
+
+    // Add a solid Fill / Stroke of `color` into `group` and return true on
+    // success. Used when a shape has no solid of the wanted kind (bare shape or
+    // one that only had a gradient we just removed). When `look` is provided
+    // (from the replaced gradient), its shared params (stroke width, opacity…)
+    // are copied over so the conversion changes only the color.
+    function createSolidGraphic(layer, group, color, isFill, look) {
+        try {
+            if (!group || !group.canAddProperty) {
+                return false;
+            }
+            var solidMatch = isFill ? "ADBE Vector Graphic - Fill" : "ADBE Vector Graphic - Stroke";
+            var colorMatch = isFill ? "ADBE Vector Fill Color" : "ADBE Vector Stroke Color";
+            if (!group.canAddProperty(solidMatch)) {
+                return false;
+            }
+            var solid = group.addProperty(solidMatch);
+            var cprop = null;
+            try { cprop = solid.property(colorMatch); } catch (eCp) {}
+            if (cprop) { setSolidColorProp(layer, cprop, color); }
+            if (look) { writeGradientAppearance(solid, look); }
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    // Remove Fill / Stroke paint (solid AND gradient graphics) of the wanted
+    // kinds from a group, recursing into nested groups. Walks descending by live
+    // index because removing a property invalidates sibling references.
+    function removePaintFromGroup(group, removeFill, removeStroke) {
+        var removed = 0;
+        try {
+            for (var j = group.numProperties; j >= 1; j--) {
+                var p = null;
+                try { p = group.property(j); } catch (eP) { continue; }
+                if (!p) { continue; }
+                var mn = p.matchName;
+                var isFillPaint = (mn === "ADBE Vector Graphic - Fill" || mn === "ADBE Vector Graphic - G-Fill");
+                var isStrokePaint = (mn === "ADBE Vector Graphic - Stroke" || mn === "ADBE Vector Graphic - G-Stroke");
+                if ((removeFill && isFillPaint) || (removeStroke && isStrokePaint)) {
+                    try { p.remove(); removed++; } catch (eR) {}
+                } else if (p.propertyType === PropertyType.INDEXED_GROUP ||
+                           p.propertyType === PropertyType.NAMED_GROUP) {
+                    removed += removePaintFromGroup(p, removeFill, removeStroke);
+                }
+            }
+        } catch (e) {}
+        return removed;
+    }
+
+    // Strip Fill / Stroke / Both paint from the selected vector layers, honoring
+    // the Fill/Stroke/Both target mode. Removes both solid and gradient graphics.
+    function removePaintFromSelection() {
+        var comp = getActiveComp();
+        if (!comp) {
+            return;
+        }
+        var layers = comp.selectedLayers;
+        if (!layers || !layers.length) {
+            if (statusText) { statusText.text = "Select one or more vector layers first."; }
+            return;
+        }
+        var removeFill = (targetMode === "fill" || targetMode === "both");
+        var removeStroke = (targetMode === "stroke" || targetMode === "both");
+        var totalRemoved = 0, touched = 0;
+        app.beginUndoGroup("Remove vector paint");
+        try {
+            for (var i = 0; i < layers.length; i++) {
+                var layer = layers[i];
+                if (layer.matchName !== "ADBE Vector Layer") { continue; }
+                var root = null;
+                try { root = layer.property("ADBE Root Vectors Group"); } catch (eRt) {}
+                if (!root) { continue; }
+                var n = removePaintFromGroup(root, removeFill, removeStroke);
+                totalRemoved += n;
+                if (n > 0) { touched++; }
+            }
+        } finally {
+            app.endUndoGroup();
+        }
+        if (statusText) {
+            var kindLabel = (removeFill && removeStroke) ? "fill + stroke" : (removeFill ? "fill" : "stroke");
+            if (totalRemoved > 0) {
+                statusText.text = "Removed " + kindLabel + " from " + touched + " layer" + (touched === 1 ? "" : "s") + ".";
+            } else {
+                statusText.text = "No " + kindLabel + " paint to remove on the selected layer(s).";
+            }
+        }
     }
 
     function applySwatch(index) {
@@ -1355,12 +2428,481 @@ function buildDynamicPaletteModule(__host__, __status__) {
         if (!layers || !layers.length) {
             return;
         }
+        var gradColorsFailed = false;
+        var appliedGrad = false;
+        var appliedSolid = false;
+        var solidCount = 0;
+        gradApplyMsg = "";
+        gradDebugLog = [];
         for (var i = 0; i < layers.length; i++) {
             var layer = layers[i];
             if (layer.matchName === "ADBE Vector Layer") {
-                applyColorToLayer(layer, swatches[index].color);
+                if (isGradient(swatches[index])) {
+                    var res = applyGradientToLayer(layer, swatches[index]);
+                    appliedGrad = true;
+                    if (res && !res.wroteColors) {
+                        gradColorsFailed = true;
+                    }
+                } else {
+                    if (applyColorToLayer(layer, swatches[index].color)) {
+                        appliedSolid = true;
+                        solidCount++;
+                    }
+                }
             }
         }
+        if (statusText) {
+            if (appliedGrad) {
+                if (gradColorsFailed) {
+                    statusText.text = gradApplyMsg || "Couldn't apply gradient colors.";
+                } else {
+                    statusText.text = "Gradient applied.";
+                }
+            } else if (appliedSolid) {
+                statusText.text = "Color applied to " + solidCount + " layer" + (solidCount === 1 ? "" : "s") + ".";
+            } else {
+                statusText.text = "Nothing to color on the selected layer(s).";
+            }
+        }
+        if (GRAD_DEBUG && appliedGrad && gradDebugLog.length) {
+            alert("Gradient apply diagnostics:\n\n" + gradDebugLog.join("\n"), SCRIPT_NAME);
+        }
+        // Removing a gradient graphic that happened to be the layer's only
+        // selected property (the .ffx apply selects the Colors property) drops
+        // the layer's selection. Re-assert the layers we started with so the
+        // user's selection survives applying a swatch.
+        try {
+            for (var rs = 0; rs < layers.length; rs++) {
+                try { if (!layers[rs].selected) { layers[rs].selected = true; } } catch (eRs) {}
+            }
+        } catch (eSel) {}
+    }
+
+    // Apply a gradient swatch to a layer. Sets the Grad Type (scriptable) and
+    // writes the stop Colors via .ffx preset injection on every gradient
+    // fill/stroke matching the target mode; if the layer has no gradient of the
+    // requested kind, adds a fresh Gradient Fill / Stroke INSIDE the shape's
+    // group (replacing the solid fill/stroke there) so the swatch always lands
+    // in the right place. Returns { wroteColors: bool }.
+    function applyGradientToLayer(layer, sw) {
+        if (!layer || !layer.property) {
+            return { wroteColors: false };
+        }
+        var root = layer.property("ADBE Root Vectors Group");
+        if (!root) {
+            return { wroteColors: false };
+        }
+        var wantFill = (targetMode === "fill" || targetMode === "both");
+        var wantStroke = (targetMode === "stroke" || targetMode === "both");
+        var wroteColors = false;
+
+        app.beginUndoGroup("Apply gradient swatch");
+        try {
+            if (wantFill && applyGradientForKind(layer, root, sw, true)) { wroteColors = true; }
+            if (wantStroke && applyGradientForKind(layer, root, sw, false)) { wroteColors = true; }
+        } finally {
+            app.endUndoGroup();
+        }
+        return { wroteColors: wroteColors };
+    }
+
+    // Apply the gradient for one kind (fill/stroke). If the layer already has a
+    // gradient of this kind, UPDATE IT IN PLACE; otherwise add a fresh one inside
+    // the shape (replacing the solid there). After writing the swatch's stop
+    // colors via applyPreset we set: the swatch's grad TYPE, the swatch's saved
+    // DIRECTION (start/end points + highlight) when it has one, and finally we
+    // RESTORE the shape's original STROKE WIDTH — captured before any change — so
+    // converting a solid stroke to a gradient (or reapplying) never resets the
+    // width to the template's 2px default. Extra gradients (leftover pileup) are
+    // deduped to keep exactly one so the preset lands cleanly.
+    function applyGradientForKind(layer, root, sw, isFill) {
+        if (!ffxHaveTemplate(isFill)) {
+            gradApplyMsg = "Couldn't build gradient preset.";
+            return false;
+        }
+        var kind = isFill ? "fill" : "stroke";
+        var matchName = isFill ? GRAD_FILL_MATCH : GRAD_STROKE_MATCH;
+
+        // Capture the CURRENT stroke width (from an existing gradient OR solid
+        // stroke) before any change, so it survives a solid→gradient conversion
+        // or the template's defaults. Stroke width belongs to the stroke, not the
+        // color, so it is always preserved from the shape.
+        var preserveWidth = isFill ? null : readCurrentStrokeWidth(root);
+
+        var have = countGradientsOfKind(layer, kind);
+        var look = null;
+        var curDir = null;
+
+        if (have > 0) {
+            // UPDATE IN PLACE. Capture the first existing gradient's appearance
+            // (fill opacity, and its direction as a fallback) and its CURRENT
+            // direction (for the toggle below), then dedupe any extras (leftover
+            // pileup) so exactly one remains — re-querying between removes because
+            // removing a property invalidates references.
+            var first = findFirstGradientOfKind(layer, kind);
+            if (first) {
+                look = readGradientAppearance(first);
+                curDir = readGradientGeometry(first);
+            }
+            while (countGradientsOfKind(layer, kind) > 1) {
+                if (!removeLastGradientOfKind(layer, kind)) { break; }
+            }
+        } else {
+            // CREATE FRESH inside the shape's contents (replacing the solid there
+            // the user was covering).
+            var group = findShapeContents(root) || root;
+            try {
+                removeSolidGraphic(group, isFill);
+                if (!group.canAddProperty || !group.canAddProperty(matchName)) {
+                    return false;
+                }
+                group.addProperty(matchName);
+            } catch (eAdd) {
+                return false;
+            }
+        }
+
+        // TOGGLE the direction: apply the swatch's saved direction, but if the
+        // gradient ALREADY has that direction (i.e. this is a second click),
+        // reset it to horizontal instead — start at the shape's leftmost point,
+        // end at its rightmost point. The actual horizontal geometry is computed
+        // after the container is rebuilt (it needs the container to convert the
+        // layer-space bounds into the gradient's group coordinate space).
+        var resetHorizontal = (sw.geom && curDir && sameDirection(curDir, sw.geom));
+
+        // Write the swatch's stop colors (+ type) onto the single surviving
+        // gradient. applyPreset matches the full parent path and writes in place;
+        // re-find the container since refs may be stale after edits.
+        var target = findFirstGradientOfKind(layer, kind);
+        if (!target) { return false; }
+        var r = applyGradientPaint(target, sw, layer, isFill);
+
+        var rebuilt = findFirstGradientOfKind(layer, kind);
+        if (rebuilt) {
+            var tp = null;
+            try { tp = rebuilt.property(GRAD_TYPE_MATCH); } catch (eTp2) {}
+            try { if (tp && tp.canSetExpression) { tp.setValue(sw.gradType); } } catch (eTs) {}
+            // Restore the original appearance first (fill opacity, original
+            // direction as fallback), then override the DIRECTION with the
+            // toggle result (swatch direction, or horizontal on the second click).
+            if (look) { writeGradientAppearance(rebuilt, look); }
+            var dirToApply = resetHorizontal
+                ? horizontalDirection(layer, rebuilt)
+                : (sw.geom || null);
+            if (dirToApply) { writeGradientGeometry(rebuilt, dirToApply); }
+            // Finally, force the preserved stroke width back on (never reset it).
+            if (!isFill && preserveWidth !== null) {
+                var wp = null;
+                try { wp = rebuilt.property(STROKE_WIDTH_MATCH); } catch (eWp) {}
+                try { if (wp && wp.canSetExpression) { wp.setValue(preserveWidth); } } catch (eWs) {}
+            }
+            if (GRAD_DEBUG) {
+                gradDebugLog.push("KIND " + kind + ": had=" + have +
+                    ", swatchGeom=" + (sw.geom ? "yes" : "no") +
+                    ", toggle=" + (resetHorizontal ? "reset-horizontal" : "swatch-dir") +
+                    ", preserveWidth=" + preserveWidth);
+            }
+        }
+        return r.wroteColors;
+    }
+
+    // Find the layer's current stroke width by locating the first stroke graphic
+    // (gradient G-Stroke or solid Stroke) under root and reading its Stroke Width
+    // leaf. Returns null if there is no stroke or it is animated.
+    function readCurrentStrokeWidth(root) {
+        var found = { w: null };
+        walkStrokeWidth(root, found);
+        return found.w;
+    }
+
+    function walkStrokeWidth(group, found) {
+        if (found.w !== null) { return; }
+        try {
+            for (var i = 1; i <= group.numProperties; i++) {
+                var p = null;
+                try { p = group.property(i); } catch (eP) { continue; }
+                if (!p) { continue; }
+                if (p.matchName === GRAD_STROKE_MATCH ||
+                    p.matchName === "ADBE Vector Graphic - Stroke") {
+                    var wp = null;
+                    try { wp = p.property(STROKE_WIDTH_MATCH); } catch (eW) {}
+                    try {
+                        if (wp && wp.numKeys === 0) { found.w = wp.value; return; }
+                    } catch (eV) {}
+                } else if (p.propertyType === PropertyType.INDEXED_GROUP ||
+                           p.propertyType === PropertyType.NAMED_GROUP) {
+                    walkStrokeWidth(p, found);
+                    if (found.w !== null) { return; }
+                }
+            }
+        } catch (e) {}
+    }
+
+    // Apply a swatch's saved DIRECTION (start/end points + highlight) onto a
+    // gradient container, so applying it reproduces the extracted direction.
+    function writeGradientGeometry(container, geom) {
+        if (!geom) { return; }
+        var sets = [
+            [GRAD_START_MATCH, geom.start],
+            [GRAD_END_MATCH, geom.end],
+            [GRAD_HLEN_MATCH, geom.hlen],
+            [GRAD_HANG_MATCH, geom.hang]
+        ];
+        for (var i = 0; i < sets.length; i++) {
+            if (sets[i][1] === undefined || sets[i][1] === null) { continue; }
+            var p = null;
+            try { p = container.property(sets[i][0]); } catch (eP) { p = null; }
+            if (!p) { continue; }
+            try { if (p.canSetExpression) { p.setValue(sets[i][1]); } } catch (eS) {}
+        }
+    }
+
+    // True when two gradient directions have the same start and end points
+    // (within a small tolerance), used to detect a repeat apply for the toggle.
+    function sameDirection(a, b) {
+        if (!a || !b || !a.start || !a.end || !b.start || !b.end) { return false; }
+        var eps = 0.5;
+        return Math.abs(a.start[0] - b.start[0]) < eps &&
+               Math.abs(a.start[1] - b.start[1]) < eps &&
+               Math.abs(a.end[0] - b.end[0]) < eps &&
+               Math.abs(a.end[1] - b.end[1]) < eps;
+    }
+
+    // Build a HORIZONTAL gradient direction spanning the shape layer's bounds:
+    // start at the leftmost point, end at the rightmost, both at the vertical
+    // center. sourceRectAtTime reports LAYER-space bounds, but a gradient's
+    // start/end points live in the coordinate space of the shape GROUP that
+    // contains it — so we convert the layer-space endpoints down through the
+    // inverse of every enclosing group's transform (position / anchor / scale /
+    // rotation). Returns null if the bounds can't be read.
+    function horizontalDirection(layer, container) {
+        try {
+            var comp = layer.containingComp;
+            var t = comp ? comp.time : 0;
+            var rect = layer.sourceRectAtTime(t, false);
+            if (!rect) { return null; }
+            var cy = rect.top + rect.height / 2;
+            var startL = [rect.left, cy];
+            var endL = [rect.left + rect.width, cy];
+            var chain = groupTransformChain(container);
+            var start = layerToGroupSpace(startL, chain);
+            var end = layerToGroupSpace(endL, chain);
+            return { start: start, end: end, hlen: 0, hang: 0 };
+        } catch (e) { return null; }
+    }
+
+    // Collect the transforms of every enclosing "ADBE Vector Group" from the
+    // gradient container up to the layer root, ordered OUTERMOST → innermost
+    // (the order in which their inverses must be applied to map a layer-space
+    // point into the container's local space).
+    function groupTransformChain(container) {
+        var stack = [];
+        var p = container;
+        try {
+            while (p) {
+                var par = null;
+                try { par = p.parentProperty; } catch (ePP) { par = null; }
+                if (!par) { break; }
+                if (par.matchName === "ADBE Vector Group") {
+                    var tf = readGroupTransform(par);
+                    if (tf) { stack.push(tf); }
+                }
+                p = par;
+            }
+        } catch (e) {}
+        stack.reverse(); // was innermost→outermost; want outermost→innermost
+        return stack;
+    }
+
+    // Read a shape group's transform into {anchor, position, scale, rotation}.
+    // Returns null if the transform group is missing.
+    function readGroupTransform(group) {
+        var tg = null;
+        try { tg = group.property("ADBE Vector Transform Group"); } catch (eTG) {}
+        if (!tg) { return null; }
+        var tf = { anchor: [0, 0], position: [0, 0], scale: [100, 100], rotation: 0 };
+        readLeafInto(tg, "ADBE Vector Anchor", tf, "anchor");
+        readLeafInto(tg, "ADBE Vector Position", tf, "position");
+        readLeafInto(tg, "ADBE Vector Scale", tf, "scale");
+        readLeafInto(tg, "ADBE Vector Rotation", tf, "rotation");
+        return tf;
+    }
+
+    function readLeafInto(group, matchName, obj, key) {
+        var p = null;
+        try { p = group.property(matchName); } catch (eP) { return; }
+        if (!p) { return; }
+        try { if (p.numKeys === 0) { obj[key] = p.value; } } catch (eV) {}
+    }
+
+    // Map a layer-space point down through a chain of group transforms (each
+    // outermost→innermost) into the innermost group's local (gradient) space by
+    // applying each transform's inverse in order. Group transform (local→parent)
+    // is: parent = position + Rot(rotation) * (scale/100 .* (local - anchor)).
+    function layerToGroupSpace(pt, chain) {
+        var x = pt[0], y = pt[1];
+        for (var i = 0; i < chain.length; i++) {
+            var tf = chain[i];
+            var dx = x - tf.position[0];
+            var dy = y - tf.position[1];
+            var rad = -tf.rotation * Math.PI / 180;
+            var c = Math.cos(rad), s = Math.sin(rad);
+            var rx = dx * c - dy * s;
+            var ry = dx * s + dy * c;
+            var sx = (tf.scale[0] || 100) / 100;
+            var sy = (tf.scale[1] || 100) / 100;
+            x = (sx !== 0 ? rx / sx : rx) + tf.anchor[0];
+            y = (sy !== 0 ? ry / sy : ry) + tf.anchor[1];
+        }
+        return [x, y];
+    }
+    function countGradientsOfKind(layer, kind) {
+        var all = getGradientContainersForLayer(layer);
+        var n = 0;
+        for (var i = 0; i < all.length; i++) { if (all[i].kind === kind) { n++; } }
+        return n;
+    }
+
+    // Return the first gradient container of a kind, freshly queried (never a
+    // stale reference held across edits).
+    function findFirstGradientOfKind(layer, kind) {
+        var all = getGradientContainersForLayer(layer);
+        for (var i = 0; i < all.length; i++) {
+            if (all[i].kind === kind) { return all[i].container; }
+        }
+        return null;
+    }
+
+    // Remove the LAST gradient container of a kind (used to dedupe pileup while
+    // keeping the first). Returns true if one was removed.
+    function removeLastGradientOfKind(layer, kind) {
+        var all = getGradientContainersForLayer(layer);
+        var last = null;
+        for (var i = 0; i < all.length; i++) {
+            if (all[i].kind === kind) { last = all[i].container; }
+        }
+        if (!last) { return false; }
+        try { last.remove(); return true; } catch (e) { return false; }
+    }
+
+    // Remove every gradient Fill / Stroke of the given kind under `group`,
+    // recursing into nested shape groups. Walks descending by live index since
+    // removing a property invalidates sibling references.
+    function removeGradientsOfKind(group, isFill) {
+        var target = isFill ? GRAD_FILL_MATCH : GRAD_STROKE_MATCH;
+        try {
+            for (var j = group.numProperties; j >= 1; j--) {
+                var p = null;
+                try { p = group.property(j); } catch (eP) { continue; }
+                if (!p) { continue; }
+                if (p.matchName === target) {
+                    try { p.remove(); } catch (eR) {}
+                } else if (p.propertyType === PropertyType.INDEXED_GROUP ||
+                           p.propertyType === PropertyType.NAMED_GROUP) {
+                    removeGradientsOfKind(p, isFill);
+                }
+            }
+        } catch (e) {}
+    }
+
+    // Set the gradient TYPE (scriptable) and write the stop Colors via .ffx
+    // preset injection on a gradient container.
+    function applyGradientPaint(container, sw, layer, isFill) {
+        var colorsProp = null, typeProp = null;
+        try { colorsProp = container.property(GRAD_COLORS_MATCH); } catch (eC) {}
+        try { typeProp = container.property(GRAD_TYPE_MATCH); } catch (eT) {}
+        if (!colorsProp) {
+            return { found: false, wroteColors: false };
+        }
+        try { if (typeProp && typeProp.canSetExpression) { typeProp.setValue(sw.gradType); } } catch (eTy) {}
+        var wroteColors = ffxApplyColors(layer, colorsProp, sw, isFill);
+        return { found: true, wroteColors: wroteColors };
+    }
+
+    // Read a gradient graphic's settable, non-animated leaf values into a plain
+    // {matchName: value} object so they survive the container being rebuilt by
+    // applyPreset. Captures GEOMETRY/appearance to preserve (start/end points,
+    // stroke width, highlight, opacity…) — but skips the NO_VALUE Grad Colors
+    // (written by the preset) and the Grad Type (taken from the swatch), so
+    // restoring this look never overrides the applied colors or type.
+    function readGradientAppearance(container) {
+        var look = {};
+        try {
+            for (var i = 1; i <= container.numProperties; i++) {
+                var sp = null;
+                try { sp = container.property(i); } catch (eSp) { continue; }
+                if (!sp || sp.matchName === GRAD_COLORS_MATCH || sp.matchName === GRAD_TYPE_MATCH) { continue; }
+                if (sp.propertyType !== PropertyType.PROPERTY) { continue; }
+                if (sp.propertyValueType === PropertyValueType.NO_VALUE) { continue; }
+                if (sp.numKeys > 0) { continue; }
+                try { look[sp.matchName] = sp.value; } catch (eV) {}
+            }
+        } catch (e) {}
+        return look;
+    }
+
+    // Restore appearance values captured by readGradientAppearance onto a fresh
+    // gradient graphic, so replacing a gradient keeps its geometry and look.
+    function writeGradientAppearance(container, look) {
+        if (!look) { return; }
+        try {
+            for (var mn in look) {
+                if (!look.hasOwnProperty(mn)) { continue; }
+                var tp = null;
+                try { tp = container.property(mn); } catch (eTp) { tp = null; }
+                if (!tp) { continue; }
+                try { tp.setValue(look[mn]); } catch (eCopy) {}
+            }
+        } catch (e) {}
+    }
+
+    // Return the contents group ("ADBE Vectors Group") of the first shape group
+    // ("ADBE Vector Group") under root, so a fresh gradient lands INSIDE the
+    // shape (where it fills correctly) instead of at the layer root (where it
+    // sits outside the shape). Returns null if the layer has no shape group.
+    function findShapeContents(root) {
+        try {
+            for (var i = 1; i <= root.numProperties; i++) {
+                var p = root.property(i);
+                if (p && p.matchName === "ADBE Vector Group") {
+                    var c = null;
+                    try { c = p.property("ADBE Vectors Group"); } catch (eC) {}
+                    if (c) { return c; }
+                }
+            }
+        } catch (e) {}
+        return null;
+    }
+
+    // Remove the solid Fill / Stroke of the given kind from a contents group, so
+    // applying a gradient replaces the flat color the user was covering (this is
+    // the manual "delete the Fill" step). Walks descending by live index since
+    // removing a property invalidates sibling references.
+    function removeSolidGraphic(contents, isFill) {
+        var target = isFill ? "ADBE Vector Graphic - Fill" : "ADBE Vector Graphic - Stroke";
+        try {
+            for (var j = contents.numProperties; j >= 1; j--) {
+                var p = contents.property(j);
+                if (p && p.matchName === target) {
+                    try { p.remove(); } catch (eR) {}
+                }
+            }
+        } catch (e) {}
+    }
+
+    // True when a .ffx template is embedded for the requested kind.
+    function ffxHaveTemplate(isFill) {
+        return isFill ? (GRAD_FFX_B64 !== "") : (GRAD_FFX_STROKE_B64 !== "");
+    }
+
+    // Save the project to disk before reading gradients: gradient colors are
+    // parsed from the last-saved .aep (the live API can't read NO_VALUE grad
+    // colors), so an unsaved edit would be invisible. Acts like Ctrl+S. If the
+    // project was never saved, save() opens a Save As dialog once.
+    function saveProjectForRead() {
+        try {
+            if (app.project) { app.project.save(); }
+        } catch (e) {}
     }
 
     function extractFromLayers() {
@@ -1374,6 +2916,14 @@ function buildDynamicPaletteModule(__host__, __status__) {
             return;
         }
 
+        var addedSolid = 0;
+        var addedGrad = 0;
+        var foundGradContainers = 0;
+        var vectorLayers = 0;
+        gradDebugLog = [];
+        saveProjectForRead();
+        resetSavedProjectCache();
+        if (GRAD_DEBUG) { gradDebugLog.push("AE version: " + app.version); }
         app.beginUndoGroup("Extract palette from layers");
         try {
             for (var i = 0; i < layers.length; i++) {
@@ -1381,6 +2931,7 @@ function buildDynamicPaletteModule(__host__, __status__) {
                 if (layer.matchName !== "ADBE Vector Layer") {
                     continue;
                 }
+                vectorLayers++;
                 var props = getColorPropertiesForLayer(layer);
                 for (var j = 0; j < props.length; j++) {
                     var entry = props[j];
@@ -1394,14 +2945,37 @@ function buildDynamicPaletteModule(__host__, __status__) {
                     var rgb = [value[0], value[1], value[2]];
                     var already = false;
                     for (var k = 0; k < swatches.length; k++) {
-                        if (colorMatches(swatches[k].color, rgb)) {
+                        if (!isGradient(swatches[k]) && colorMatches(swatches[k].color, rgb)) {
                             already = true;
                             break;
                         }
                     }
                     if (!already) {
                         var label = layer.name + " " + (entry.kind === "stroke" ? "Stroke" : "Fill");
-                        swatches.push({ name: label, color: rgb });
+                        swatches.push({ type: "solid", name: label, color: rgb });
+                        addedSolid++;
+                    }
+                }
+                // Gradient fills / strokes
+                var grads = getGradientContainersForLayer(layer, comp);
+                foundGradContainers += grads.length;
+                for (var gi = 0; gi < grads.length; gi++) {
+                    var gsw = readGradientFromContainer(grads[gi].container, grads[gi].kind, grads[gi].nav);
+                    if (!gsw) {
+                        continue;
+                    }
+                    var gsig = gradientSignature(gsw);
+                    var gdup = false;
+                    for (var gk = 0; gk < swatches.length; gk++) {
+                        if (isGradient(swatches[gk]) && gradientSignature(swatches[gk]) === gsig) {
+                            gdup = true;
+                            break;
+                        }
+                    }
+                    if (!gdup) {
+                        gsw.name = layer.name + " " + (gsw.kind === "stroke" ? "Grad Stroke" : "Grad Fill");
+                        swatches.push(gsw);
+                        addedGrad++;
                     }
                 }
             }
@@ -1413,6 +2987,27 @@ function buildDynamicPaletteModule(__host__, __status__) {
         saveCurrentPalette();
         rebuildSwatches();
         updateStatus();
+        if (statusText) {
+            if (!vectorLayers) {
+                statusText.text = "Extract: no shape layers selected.";
+            } else if (addedSolid || addedGrad) {
+                statusText.text = "Extracted " + addedSolid + " color" + (addedSolid === 1 ? "" : "s") +
+                    ", " + addedGrad + " gradient" + (addedGrad === 1 ? "" : "s") + ".";
+            } else if (foundGradContainers) {
+                var unsaved = false;
+                try { unsaved = !app.project.file; } catch (eUf) {}
+                if (unsaved) {
+                    statusText.text = "Found " + foundGradContainers + " gradient(s) — save the project first (colors are read from the saved .aep).";
+                } else {
+                    statusText.text = "Found " + foundGradContainers + " gradient(s) but couldn't read colors — save the project (Cmd/Ctrl+S) and retry; colors come from the saved .aep.";
+                }
+                if (GRAD_DEBUG && gradDebugLog.length) {
+                    alert("Gradient read diagnostics:\n\n" + gradDebugLog.join("\n"), SCRIPT_NAME);
+                }
+            } else {
+                statusText.text = "Extract: nothing new found on the selected layer(s).";
+            }
+        }
     }
 
     function readAseFile(file) {
@@ -1647,7 +3242,7 @@ function buildDynamicPaletteModule(__host__, __status__) {
 
         swatches = [];
         for (var i = 0; i < imported.length; i++) {
-            swatches.push({ name: imported[i].name || "ASE Swatch", color: imported[i].color });
+            swatches.push({ type: "solid", name: imported[i].name || "ASE Swatch", color: imported[i].color });
         }
         paletteName = newName;
         if (!listContains(paletteCatalog, newName)) {
@@ -1671,10 +3266,22 @@ function buildDynamicPaletteModule(__host__, __status__) {
         }
         var w = (this.size && this.size[0]) ? this.size[0] : CELL;
         var h = (this.size && this.size[1]) ? this.size[1] : CELL;
-        var brush = g.newBrush(g.BrushType.SOLID_COLOR, [swatch.color[0], swatch.color[1], swatch.color[2], 1]);
-        g.newPath();
-        g.rectPath(0, 0, w, h);
-        g.fillPath(brush);
+        if (isGradient(swatch)) {
+            var bands = w;
+            for (var bx = 0; bx < bands; bx++) {
+                var t = bands > 1 ? (bx / (bands - 1)) : 0;
+                var c = gradientColorAt(swatch.stops, t);
+                var gb = g.newBrush(g.BrushType.SOLID_COLOR, [c[0], c[1], c[2], 1]);
+                g.newPath();
+                g.rectPath(bx, 0, 1, h);
+                g.fillPath(gb);
+            }
+        } else {
+            var brush = g.newBrush(g.BrushType.SOLID_COLOR, [swatch.color[0], swatch.color[1], swatch.color[2], 1]);
+            g.newPath();
+            g.rectPath(0, 0, w, h);
+            g.fillPath(brush);
+        }
         if (this.swatchIndex === selectedIndex) {
             var outer = g.newPen(g.PenType.SOLID_COLOR, [1, 1, 1, 1], 2);
             g.newPath();
@@ -1718,6 +3325,8 @@ function buildDynamicPaletteModule(__host__, __status__) {
         "remove": { vb: [0, -960, 960, 960], d: "m448-326 112-112 112 112 43-43-113-111 111-111-43-43-110 112-112-112-43 43 113 111-113 111 43 43Zm-98 166q-14.25 0-27-6.38-12.75-6.37-21-17.62L80-480l221-296q8.25-11.25 21-17.63 12.75-6.37 27-6.37h472q24.75 0 42.38 17.62Q881-764.75 881-740v520q0 24.75-17.62 42.37Q845.75-160 821-160H350ZM155-480l195 260h471v-520H350L155-480Zm431 0Z" },
         // cancel_presentation — clear all swatches
         "clear": { vb: [0, -960, 960, 960], d: "m358-316 122-122 122 122 42-42-122-122 122-122-42-42-122 122-122-122-42 42 122 122-122 122 42 42ZM140-160q-24 0-42-18t-18-42v-520q0-24 18-42t42-18h680q24 0 42 18t18 42v520q0 24-18 42t-42 18H140Zm0-60h680v-520H140v520Zm0 0v-520 520Z" },
+        // open_in_new_off — strip Fill / Stroke paint from selected shapes
+        "removepaint": { vb: [0, -960, 960, 960], d: "m791-55-65-65H200q-33 0-56.5-23.5T120-200v-526l-65-65 57-57 736 736-57 57ZM200-200h446L451-395l-63 63-56-56 63-63-195-195v446Zm114-560-80-80h246v80H314Zm251 251-56-56 195-195H560v-80h280v280h-80v-144L565-509Zm275 275-80-80v-166h80v246Z" },
         // dialogs — apply to Fill only (filled square)
         "fill": { vb: [0, -960, 960, 960], d: "M264-264h432v-432H264v432Zm-84 144q-24 0-42-18t-18-42v-600q0-24 18-42t42-18h600q24 0 42 18t18 42v600q0 24-18 42t-42 18H180Zm0-60h600v-600H180v600Zm0-600v600-600Z" },
         // crop_square — apply to Stroke only (outline square)
@@ -1996,8 +3605,13 @@ function buildDynamicPaletteModule(__host__, __status__) {
             cell.size = [CELL, CELL];
             cell.preferredSize = [CELL, CELL];
             cell.swatchIndex = i;
-            cell.helpTip = swatches[i].name + "\n" + Math.round(swatches[i].color[0] * 255) + "," +
-                Math.round(swatches[i].color[1] * 255) + "," + Math.round(swatches[i].color[2] * 255);
+            if (isGradient(swatches[i])) {
+                cell.helpTip = swatches[i].name + "\n" + swatches[i].stops.length + " stops • " +
+                    (swatches[i].gradType === 2 ? "radial" : "linear");
+            } else {
+                cell.helpTip = swatches[i].name + "\n" + Math.round(swatches[i].color[0] * 255) + "," +
+                    Math.round(swatches[i].color[1] * 255) + "," + Math.round(swatches[i].color[2] * 255);
+            }
             cell.onDraw = drawSwatch;
             cell.onClick = makeSwatchClick(i);
         }
@@ -2032,14 +3646,25 @@ function buildDynamicPaletteModule(__host__, __status__) {
             return;
         }
         if (selectedIndex >= 0 && swatches[selectedIndex]) {
-            hexField.text = rgbToHex(swatches[selectedIndex].color);
+            if (isGradient(swatches[selectedIndex])) {
+                hexField.text = "(gradient)";
+                hexField.enabled = false;
+            } else {
+                hexField.text = rgbToHex(swatches[selectedIndex].color);
+                hexField.enabled = true;
+            }
         } else {
             hexField.text = "";
+            hexField.enabled = true;
         }
     }
 
     function applyHexToSelected() {
         if (selectedIndex < 0 || !swatches[selectedIndex]) {
+            return;
+        }
+        if (isGradient(swatches[selectedIndex])) {
+            updateHexField();
             return;
         }
         var rgb = hexToRgb(hexField ? hexField.text : "");
@@ -2157,6 +3782,9 @@ function buildDynamicPaletteModule(__host__, __status__) {
         var actionFlow = makeFlow(actionHost, 4);
         actionFlow.add(34, function (row) {
             makeActionButton(row, "extract", "Extract colors from selected layers", extractFromLayers);
+        });
+        actionFlow.add(34, function (row) {
+            makeActionButton(row, "removepaint", "Remove Fill / Stroke / Both from selected layers (per target mode)", removePaintFromSelection);
         });
         actionFlow.add(34, function (row) {
             makeActionButton(row, "add", "Add Color", addColor);
@@ -2320,6 +3948,7 @@ function buildDynamicPaletteModule(__host__, __status__) {
         // Build the toolbars once so their controls exist before palette data
         // is loaded into them, then load state.
         reflowToolbars();
+        resetDefaultsIfNeeded();
         loadPalette();
         setTargetMode(targetMode);
 

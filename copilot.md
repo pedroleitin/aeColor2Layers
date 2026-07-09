@@ -61,6 +61,32 @@ clone-and-move or stored-reference deletion — that's exactly the v0.6 bug.
 UI is built in `buildUI`; each action runs inside `app.beginUndoGroup` / `app.endUndoGroup`
 so the whole batch reverts with one undo.
 
+**Gradient palette pipeline (the fragile part):**
+
+`ADBE Vector Grad Colors` is a `NO_VALUE` property — `setValue` can't touch it on any AE build.
+So gradient swatches `{gradType, stops, alphaStops, geom}` are written via **animation-preset
+injection** and read by **parsing the saved `.aep`**:
+
+1. **Read** — `readGradientStopsFromAep` parses the last-saved project for the stop colors
+   (Extract auto-saves first); `readGradientGeometry` grabs the scriptable start/end points +
+   highlight into `geom`.
+2. **Write** — `ffxGenerate` rebuilds the `<prop.map>` XML of an embedded `.ffx` template from
+   the swatch's stops, patches the RIFX ancestor chunk sizes, and `ffxApplyColors` writes a temp
+   `.ffx` and `layer.applyPreset`s it. `applyPreset` matches the **full parent path**, so fill
+   and stroke use separate templates (`GRAD_FFX_B64` / `GRAD_FFX_STROKE_B64`), and the gradient
+   must sit **inside** the shape's `ADBE Vectors Group` (root-level spawns a phantom).
+3. **`applyGradientForKind`** updates an existing gradient **in place** (never remove+recreate),
+   because the fill preset resets the container's geometry. It captures stroke width + geometry
+   before, applies colors/type, then restores: the swatch's saved direction (or a **horizontal**
+   reset on a repeat apply — the direction *toggle*), and the original stroke width. The
+   horizontal reset maps `sourceRectAtTime` (layer space) through the **inverse of every
+   enclosing group transform** into the gradient's group-local space.
+4. `applySwatch` re-asserts the originally-selected layers at the end (removing the selected
+   gradient during a gradient→solid swap would otherwise drop the layer's selection).
+
+`getDefaultSwatches` ships imported ASE colors; bumping `DEFAULTS_VERSION` clears the persisted
+palette in `app.settings` **once** and reinstalls them.
+
 ## Conventions to preserve
 
 - **matchName, not display name** — AE properties are addressed by matchName strings
@@ -77,8 +103,9 @@ so the whole batch reverts with one undo.
 
 ## Known limitations (don't "fix" silently — they're documented choices)
 
-Gradients skipped, mean isn't area-weighted, label table is AE CC defaults (not the user's
-customized labels), CIE76 not CIEDE2000. See `README.md` → "What it does NOT do".
+Gradients skipped **for Tint** (the palette handles them), mean isn't area-weighted, label
+table is AE CC defaults (not the user's customized labels), CIE76 not CIEDE2000. See
+`README.md` → "What it does NOT do".
 
 ## Verifying a change (no test suite)
 
